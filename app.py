@@ -548,7 +548,7 @@ def render_player_picker(
         )
         entry_param = "&entry=1" if lock_on_pick else ""
         cards.append(
-            f'<a class="player-tile{selected_class}" href="?player_id={player["id"]}{entry_param}">'
+            f'<a class="player-tile{selected_class}" href="?player_id={player["id"]}{entry_param}" target="_self">'
             f'<div class="player-tile-photo">{photo}</div>'
             f'<div class="player-tile-name" style="color:{color};">{safe_name}{safe_badge}</div>'
             '</a>'
