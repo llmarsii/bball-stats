@@ -9,8 +9,6 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The local default password is `hoops`.
-
 On Windows, you can also double-click `start.bat`. It starts the app on:
 
 ```text
@@ -39,14 +37,7 @@ Streamlit Community Cloud currently describes app hosting as free and deploys di
 4. Sign in with GitHub.
 5. Click `Create app`.
 6. Choose the GitHub repo, branch, and `app.py` as the app file.
-7. In `Advanced settings`, add the password secret shown below.
-8. Deploy the app and share the generated `*.streamlit.app` URL with the group.
-
-Before sharing it with friends, set a secret named `APP_PASSWORD` in Streamlit Community Cloud:
-
-```toml
-APP_PASSWORD = "choose-a-real-group-password"
-```
+7. Deploy the app and share the generated `*.streamlit.app` URL with the group.
 
 ## Data storage note
 

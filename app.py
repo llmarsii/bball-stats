@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import os
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -218,39 +217,6 @@ def init_db() -> None:
                 """,
                 [(name, index, now) for index, name in enumerate(DEFAULT_PLAYERS)],
             )
-
-
-def get_secret(name: str, default: str = "") -> str:
-    try:
-        value = st.secrets.get(name, "")
-    except Exception:
-        value = ""
-    return str(value or os.environ.get(name, default))
-
-
-def require_password() -> bool:
-    configured_password = get_secret("APP_PASSWORD", "hoops")
-    if st.session_state.get("authenticated"):
-        return True
-
-    st.title(APP_TITLE)
-    st.caption("Private group access")
-    with st.form("login_form"):
-        password = st.text_input("Group password", type="password")
-        submitted = st.form_submit_button("Enter")
-
-    if submitted:
-        if password == configured_password:
-            st.session_state.authenticated = True
-            st.rerun()
-        st.error("That password did not match.")
-
-    if configured_password == "hoops":
-        st.info(
-            "Local default password is `hoops`. Set `APP_PASSWORD` in Streamlit "
-            "secrets before sharing the deployed app."
-        )
-    return False
 
 
 @st.cache_data(ttl=2)
@@ -1119,18 +1085,10 @@ def main() -> None:
     init_db()
     background_key = night_background_key(active_background_date())
     inject_css(background_data_url(background_key))
-    if not require_password():
-        return
 
     players = get_players()
-    header_cols = st.columns([3, 1])
-    with header_cols[0]:
-        st.title(APP_TITLE)
-        st.caption("Shared box scores for pickup nights.")
-    with header_cols[1]:
-        if st.button("Log out", use_container_width=True):
-            st.session_state.authenticated = False
-            st.rerun()
+    st.title(APP_TITLE)
+    st.caption("Shared box scores for pickup nights.")
 
     tab_game, tab_player, tab_summary, tab_leaderboard, tab_backgrounds, tab_roster = st.tabs(
         ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Backgrounds", "Roster"]
