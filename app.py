@@ -548,6 +548,62 @@ def render_nightly_summary() -> None:
     )
 
 
+def player_history(player_id: int) -> pd.DataFrame:
+    df = all_stats()
+    if df.empty:
+        return df
+    df = df[df["player_id"] == player_id].copy()
+    df = add_percentages(df)
+    return df.sort_values("game_date", ascending=False)
+
+
+def csv_safe_name(name: str) -> str:
+    safe_name = "".join(char.lower() if char.isalnum() else "_" for char in name)
+    return "_".join(part for part in safe_name.split("_") if part) or "player"
+
+
+def render_player_page(players: list[dict]) -> None:
+    st.subheader("Player Page")
+    current_player_id = selected_player_id(players)
+    current_player = next(player for player in players if player["id"] == current_player_id)
+    render_player_picker(players, current_player_id, {})
+
+    header_cols = st.columns([1, 4])
+    with header_cols[0]:
+        render_photo(current_player, size=112)
+    with header_cols[1]:
+        st.markdown(f"### {current_player['name']}")
+        st.caption("Night-by-night stat history. Click any column header to sort.")
+
+    history = player_history(current_player_id)
+    if history.empty:
+        st.info(f"No stat lines saved for {current_player['name']} yet.")
+        return
+
+    completed = history[history["result"].isin(["W", "L"])]
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Games", history["game_date"].nunique())
+    metric_cols[1].metric("Wins", int((completed["result"] == "W").sum()))
+    metric_cols[2].metric("PPG", round(history["points"].mean(), 1))
+    metric_cols[3].metric("RPG", round(history["rebounds"].mean(), 1))
+
+    display_columns = ["game_date", *SUMMARY_COLUMNS.keys()]
+    display_columns.remove("name")
+    display = history[display_columns].rename(
+        columns={
+            "game_date": "Date",
+            **SUMMARY_COLUMNS,
+        }
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Player CSV",
+        data=display.to_csv(index=False),
+        file_name=f"{csv_safe_name(current_player['name'])}_stats.csv",
+        mime="text/csv",
+    )
+
+
 def render_leaderboard() -> None:
     st.subheader("Leaderboards")
     df = all_stats()
@@ -752,11 +808,13 @@ def main() -> None:
             st.session_state.authenticated = False
             st.rerun()
 
-    tab_game, tab_summary, tab_leaderboard, tab_roster = st.tabs(
-        ["Game Night", "Nightly Summary", "Leaderboards", "Roster"]
+    tab_game, tab_player, tab_summary, tab_leaderboard, tab_roster = st.tabs(
+        ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Roster"]
     )
     with tab_game:
         render_game_night(players)
+    with tab_player:
+        render_player_page(players)
     with tab_summary:
         render_nightly_summary()
     with tab_leaderboard:
