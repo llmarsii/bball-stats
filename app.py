@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import html
 import os
 import sqlite3
 from datetime import date, datetime
@@ -22,12 +24,32 @@ DEFAULT_PLAYERS = [
 ]
 STAT_FIELDS = {
     "points": "PTS",
+    "field_goals_made": "FGM",
+    "field_goals_attempted": "FGA",
     "rebounds": "REB",
     "assists": "AST",
     "steals": "STL",
     "blocks": "BLK",
     "threes": "3PM",
+    "three_attempts": "3PA",
     "turnovers": "TO",
+}
+SUMMARY_COLUMNS = {
+    "name": "Player",
+    "result": "W/L",
+    "points": "PTS",
+    "field_goals_made": "FGM",
+    "field_goals_attempted": "FGA",
+    "fg_pct": "FG%",
+    "threes": "3PM",
+    "three_attempts": "3PA",
+    "three_pct": "3P%",
+    "rebounds": "REB",
+    "assists": "AST",
+    "steals": "STL",
+    "blocks": "BLK",
+    "turnovers": "TO",
+    "notes": "Notes",
 }
 
 
@@ -67,11 +89,14 @@ def init_db() -> None:
                 player_id INTEGER NOT NULL REFERENCES players(id),
                 result TEXT NOT NULL DEFAULT '',
                 points INTEGER NOT NULL DEFAULT 0,
+                field_goals_made INTEGER NOT NULL DEFAULT 0,
+                field_goals_attempted INTEGER NOT NULL DEFAULT 0,
                 rebounds INTEGER NOT NULL DEFAULT 0,
                 assists INTEGER NOT NULL DEFAULT 0,
                 steals INTEGER NOT NULL DEFAULT 0,
                 blocks INTEGER NOT NULL DEFAULT 0,
                 threes INTEGER NOT NULL DEFAULT 0,
+                three_attempts INTEGER NOT NULL DEFAULT 0,
                 turnovers INTEGER NOT NULL DEFAULT 0,
                 notes TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
@@ -79,6 +104,17 @@ def init_db() -> None:
             )
             """
         )
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
+        }
+        migrations = {
+            "field_goals_made": "INTEGER NOT NULL DEFAULT 0",
+            "field_goals_attempted": "INTEGER NOT NULL DEFAULT 0",
+            "three_attempts": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in migrations.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE game_stats ADD COLUMN {column} {definition}")
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
             now = datetime.utcnow().isoformat()
@@ -196,18 +232,22 @@ def save_stat_line(game_date: date, player_id: int, values: dict) -> None:
         conn.execute(
             """
             INSERT INTO game_stats (
-                game_date, player_id, result, points, rebounds, assists,
-                steals, blocks, threes, turnovers, notes, updated_at
+                game_date, player_id, result, points, field_goals_made,
+                field_goals_attempted, rebounds, assists, steals, blocks,
+                threes, three_attempts, turnovers, notes, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(game_date, player_id) DO UPDATE SET
                 result = excluded.result,
                 points = excluded.points,
+                field_goals_made = excluded.field_goals_made,
+                field_goals_attempted = excluded.field_goals_attempted,
                 rebounds = excluded.rebounds,
                 assists = excluded.assists,
                 steals = excluded.steals,
                 blocks = excluded.blocks,
                 threes = excluded.threes,
+                three_attempts = excluded.three_attempts,
                 turnovers = excluded.turnovers,
                 notes = excluded.notes,
                 updated_at = excluded.updated_at
@@ -217,11 +257,14 @@ def save_stat_line(game_date: date, player_id: int, values: dict) -> None:
                 player_id,
                 values["result"],
                 values["points"],
+                values["field_goals_made"],
+                values["field_goals_attempted"],
                 values["rebounds"],
                 values["assists"],
                 values["steals"],
                 values["blocks"],
                 values["threes"],
+                values["three_attempts"],
                 values["turnovers"],
                 values["notes"],
                 now,
@@ -240,11 +283,14 @@ def all_stats() -> pd.DataFrame:
                 p.id AS player_id,
                 gs.result,
                 gs.points,
+                gs.field_goals_made,
+                gs.field_goals_attempted,
                 gs.rebounds,
                 gs.assists,
                 gs.steals,
                 gs.blocks,
                 gs.threes,
+                gs.three_attempts,
                 gs.turnovers,
                 gs.notes,
                 gs.updated_at
@@ -274,6 +320,84 @@ def format_game_date(game_date: date) -> str:
     return f"{game_date:%b} {game_date.day}, {game_date:%Y}"
 
 
+def selected_player_id(players: list[dict]) -> int:
+    try:
+        requested_id = int(st.query_params.get("player_id", players[0]["id"]))
+    except (TypeError, ValueError):
+        requested_id = players[0]["id"]
+
+    player_ids = {player["id"] for player in players}
+    return requested_id if requested_id in player_ids else players[0]["id"]
+
+
+def photo_src(player: dict) -> str:
+    if not player.get("photo_blob"):
+        return ""
+    mime_type = player.get("photo_mime") or "image/png"
+    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def render_player_picker(players: list[dict], current_player_id: int, existing_stats: dict[int, dict]) -> None:
+    cards = []
+    for player in players:
+        safe_name = html.escape(player["name"])
+        active_class = " active" if player["id"] == current_player_id else ""
+        result = existing_stats.get(player["id"], {}).get("result", "")
+        saved_badge = f"<span class='saved-badge'>{result or 'Saved'}</span>" if player["id"] in existing_stats else ""
+        src = photo_src(player)
+        photo = (
+            f"<img src='{src}' alt='{safe_name}'>"
+            if src
+            else "<div class='picker-placeholder'>+</div>"
+        )
+        cards.append(
+            f"""
+            <a class="player-card{active_class}" href="?player_id={player['id']}">
+                <div class="picker-photo">{photo}</div>
+                <div class="picker-name">{safe_name}</div>
+                {saved_badge}
+            </a>
+            """
+        )
+
+    st.markdown(
+        f"""
+        <div class="player-strip">
+            {''.join(cards)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    if result.empty:
+        return result
+    result["fg_pct"] = result.apply(
+        lambda row: round(row["field_goals_made"] / row["field_goals_attempted"], 3)
+        if row["field_goals_attempted"]
+        else None,
+        axis=1,
+    )
+    result["three_pct"] = result.apply(
+        lambda row: round(row["threes"] / row["three_attempts"], 3)
+        if row["three_attempts"]
+        else None,
+        axis=1,
+    )
+    return result
+
+
+def nightly_summary(game_date: date) -> pd.DataFrame:
+    df = all_stats()
+    if df.empty:
+        return df
+    df = df[df["game_date"] == game_date.isoformat()].copy()
+    return add_percentages(df)
+
+
 def render_photo(player: dict, size: int = 96) -> None:
     if player.get("photo_blob"):
         st.image(player["photo_blob"], width=size)
@@ -288,63 +412,140 @@ def render_photo(player: dict, size: int = 96) -> None:
     )
 
 
+def render_stat_form(player: dict, game_date: date, stats: dict) -> None:
+    result_options = ["", "W", "L"]
+    current_result = stats.get("result", "")
+    result_index = result_options.index(current_result) if current_result in result_options else 0
+
+    with st.form(f"stat_form_{game_date}_{player['id']}"):
+        st.markdown(f"### {player['name']} stats for {format_game_date(game_date)}")
+        result = st.radio(
+            "Team result",
+            options=result_options,
+            index=result_index,
+            horizontal=True,
+            format_func=lambda option: "Unset" if option == "" else option,
+            key=f"result_{game_date}_{player['id']}",
+        )
+
+        stat_values = {"result": result}
+        first_row = st.columns(5)
+        for index, field in enumerate(["points", "field_goals_made", "field_goals_attempted", "threes", "three_attempts"]):
+            with first_row[index]:
+                stat_values[field] = stat_input(
+                    STAT_FIELDS[field],
+                    f"{field}_{game_date}_{player['id']}",
+                    stats.get(field, 0),
+                )
+
+        second_row = st.columns(5)
+        for index, field in enumerate(["rebounds", "assists", "steals", "blocks", "turnovers"]):
+            with second_row[index]:
+                stat_values[field] = stat_input(
+                    STAT_FIELDS[field],
+                    f"{field}_{game_date}_{player['id']}",
+                    stats.get(field, 0),
+                )
+
+        stat_values["notes"] = st.text_input(
+            "Notes",
+            value=stats.get("notes", ""),
+            key=f"notes_{game_date}_{player['id']}",
+            placeholder="Optional",
+        )
+        submitted = st.form_submit_button(
+            "Save Stat Line",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        save_stat_line(game_date, player["id"], stat_values)
+        all_stats.clear()
+        st.session_state[f"editing_{game_date}_{player['id']}"] = False
+        st.success(f"Saved {player['name']} for {format_game_date(game_date)}.")
+        st.rerun()
+
+
+def render_saved_stat_line(player: dict, game_date: date, stats: dict) -> None:
+    st.markdown(f"### {player['name']} stat line")
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("PTS", stats.get("points", 0))
+    metric_cols[1].metric(
+        "FG",
+        f"{stats.get('field_goals_made', 0)}/{stats.get('field_goals_attempted', 0)}",
+    )
+    metric_cols[2].metric("3PT", f"{stats.get('threes', 0)}/{stats.get('three_attempts', 0)}")
+    metric_cols[3].metric("REB", stats.get("rebounds", 0))
+    metric_cols[4].metric("AST", stats.get("assists", 0))
+
+    detail_cols = st.columns(5)
+    detail_cols[0].metric("STL", stats.get("steals", 0))
+    detail_cols[1].metric("BLK", stats.get("blocks", 0))
+    detail_cols[2].metric("TO", stats.get("turnovers", 0))
+    detail_cols[3].metric("W/L", stats.get("result") or "Unset")
+    detail_cols[4].metric("Date", format_game_date(game_date))
+
+    if stats.get("notes"):
+        st.caption(f"Notes: {stats['notes']}")
+
+    if st.button("Edit Stat Line", key=f"edit_{game_date}_{player['id']}", type="primary", use_container_width=True):
+        st.session_state[f"editing_{game_date}_{player['id']}"] = True
+        st.rerun()
+
+
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
     game_date = st.date_input("Playing date", value=date.today())
     existing_stats = stats_for_date(game_date)
+    current_player_id = selected_player_id(players)
+    current_player = next(player for player in players if player["id"] == current_player_id)
+    current_stats = existing_stats.get(current_player_id, {})
+    edit_key = f"editing_{game_date}_{current_player_id}"
 
-    st.caption("Upload or replace profile photos next to names, then enter the stat line for the selected date.")
+    st.caption("Pick your photo/name from the row, then enter or edit only your stat line.")
+    render_player_picker(players, current_player_id, existing_stats)
 
-    for player in players:
-        stats = existing_stats.get(player["id"], {})
-        with st.container(border=True):
-            top_cols = st.columns([1, 3, 2])
-            with top_cols[0]:
-                render_photo(player, size=92)
-            with top_cols[1]:
-                st.markdown(f"### {player['name']}")
-                uploaded = st.file_uploader(
-                    "+ profile photo",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    key=f"photo_{player['id']}",
-                )
-                if uploaded is not None:
-                    update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
-                    st.success("Photo saved.")
-                    st.rerun()
-            with top_cols[2]:
-                result_options = ["", "W", "L"]
-                current_result = stats.get("result", "")
-                result_index = result_options.index(current_result) if current_result in result_options else 0
-                result = st.radio(
-                    "Team result",
-                    options=result_options,
-                    index=result_index,
-                    horizontal=True,
-                    format_func=lambda option: "Unset" if option == "" else option,
-                    key=f"result_{game_date}_{player['id']}",
-                )
-
-            stat_cols = st.columns(7)
-            stat_values = {"result": result}
-            for index, (field, label) in enumerate(STAT_FIELDS.items()):
-                with stat_cols[index]:
-                    stat_values[field] = stat_input(
-                        label,
-                        f"{field}_{game_date}_{player['id']}",
-                        stats.get(field, 0),
-                    )
-            stat_values["notes"] = st.text_input(
-                "Notes",
-                value=stats.get("notes", ""),
-                key=f"notes_{game_date}_{player['id']}",
-                placeholder="Optional",
+    with st.container(border=True):
+        top_cols = st.columns([1, 4])
+        with top_cols[0]:
+            render_photo(current_player, size=112)
+        with top_cols[1]:
+            st.markdown(f"### {current_player['name']}")
+            uploaded = st.file_uploader(
+                "+ profile photo",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"photo_{current_player['id']}",
             )
+            if uploaded is not None:
+                update_player_photo(current_player["id"], uploaded.getvalue(), uploaded.type)
+                st.success("Photo saved.")
+                st.rerun()
 
-            if st.button("Save stat line", key=f"save_{game_date}_{player['id']}", use_container_width=True):
-                save_stat_line(game_date, player["id"], stat_values)
-                all_stats.clear()
-                st.success(f"Saved {player['name']} for {format_game_date(game_date)}.")
+        if current_stats and not st.session_state.get(edit_key, False):
+            render_saved_stat_line(current_player, game_date, current_stats)
+        else:
+            render_stat_form(current_player, game_date, current_stats)
+
+
+def render_nightly_summary() -> None:
+    st.subheader("Nightly Summary")
+    game_date = st.date_input("Summary date", value=date.today(), key="summary_date")
+    summary = nightly_summary(game_date)
+
+    if summary.empty:
+        st.info(f"No stat lines saved for {format_game_date(game_date)} yet.")
+        return
+
+    display = summary[list(SUMMARY_COLUMNS.keys())].rename(columns=SUMMARY_COLUMNS)
+    st.caption("Click any column header to sort the table.")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Nightly CSV",
+        data=display.to_csv(index=False),
+        file_name=f"pickup_stats_{game_date.isoformat()}.csv",
+        mime="text/csv",
+    )
 
 
 def render_leaderboard() -> None:
@@ -365,15 +566,20 @@ def render_leaderboard() -> None:
         W=("result", lambda values: int((values == "W").sum())),
         L=("result", lambda values: int((values == "L").sum())),
         PTS=("points", "sum"),
+        FGM=("field_goals_made", "sum"),
+        FGA=("field_goals_attempted", "sum"),
         REB=("rebounds", "sum"),
         AST=("assists", "sum"),
         STL=("steals", "sum"),
         BLK=("blocks", "sum"),
-        THREES=("threes", "sum"),
+        THREE_PM=("threes", "sum"),
+        THREE_PA=("three_attempts", "sum"),
         TO=("turnovers", "sum"),
     )
     grouped["WIN%"] = (grouped["W"] / grouped["GP"]).round(3)
     grouped["PPG"] = (grouped["PTS"] / grouped["GP"]).round(1)
+    grouped["FG%"] = grouped.apply(lambda row: round(row["FGM"] / row["FGA"], 3) if row["FGA"] else None, axis=1)
+    grouped["3P%"] = grouped.apply(lambda row: round(row["THREE_PM"] / row["THREE_PA"], 3) if row["THREE_PA"] else None, axis=1)
     grouped["RPG"] = (grouped["REB"] / grouped["GP"]).round(1)
     grouped["APG"] = (grouped["AST"] / grouped["GP"]).round(1)
     grouped = grouped.sort_values(["W", "WIN%", "PPG"], ascending=False)
@@ -387,7 +593,7 @@ def render_leaderboard() -> None:
     st.dataframe(grouped, use_container_width=True, hide_index=True)
 
     with st.expander("All saved stat lines"):
-        display_df = df.rename(columns={"threes": "3PM", "turnovers": "TO"})
+        display_df = add_percentages(df).rename(columns=SUMMARY_COLUMNS)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         st.download_button(
             "Download CSV",
@@ -443,6 +649,78 @@ def inject_css() -> None:
             font-weight: 700;
             justify-content: center;
         }
+        .player-strip {
+            display: flex;
+            gap: 0.75rem;
+            margin: 0.75rem 0 1rem;
+            overflow-x: auto;
+            padding: 0.25rem 0 0.75rem;
+        }
+        .player-card {
+            align-items: center;
+            border: 1px solid #d4d4d4;
+            border-radius: 8px;
+            color: #171717 !important;
+            display: flex;
+            flex: 0 0 128px;
+            flex-direction: column;
+            gap: 0.4rem;
+            min-height: 156px;
+            padding: 0.65rem;
+            position: relative;
+            text-align: center;
+            text-decoration: none !important;
+        }
+        .player-card.active {
+            border: 3px solid #ef4444;
+            padding: calc(0.65rem - 2px);
+        }
+        .picker-photo,
+        .picker-photo img,
+        .picker-placeholder {
+            height: 86px;
+            width: 86px;
+        }
+        .picker-photo img {
+            border-radius: 8px;
+            object-fit: cover;
+        }
+        .picker-placeholder {
+            align-items: center;
+            background: #f3f4f6;
+            border: 2px dashed #a3a3a3;
+            border-radius: 8px;
+            color: #737373;
+            display: flex;
+            font-size: 2rem;
+            font-weight: 700;
+            justify-content: center;
+        }
+        .picker-name {
+            font-size: 0.9rem;
+            font-weight: 700;
+            line-height: 1.15;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+        }
+        .saved-badge {
+            background: #171717;
+            border-radius: 999px;
+            color: #ffffff;
+            font-size: 0.7rem;
+            font-weight: 700;
+            line-height: 1;
+            padding: 0.25rem 0.45rem;
+            position: absolute;
+            right: 0.35rem;
+            top: 0.35rem;
+        }
+        div[data-testid="stFormSubmitButton"] button[kind="primary"],
+        div[data-testid="stButton"] button[kind="primary"] {
+            min-height: 3rem;
+            font-size: 1.05rem;
+            font-weight: 800;
+        }
         [data-testid="stMetric"] {
             background: #fafafa;
             border: 1px solid #e5e7eb;
@@ -474,9 +752,13 @@ def main() -> None:
             st.session_state.authenticated = False
             st.rerun()
 
-    tab_game, tab_leaderboard, tab_roster = st.tabs(["Game Night", "Leaderboards", "Roster"])
+    tab_game, tab_summary, tab_leaderboard, tab_roster = st.tabs(
+        ["Game Night", "Nightly Summary", "Leaderboards", "Roster"]
+    )
     with tab_game:
         render_game_night(players)
+    with tab_summary:
+        render_nightly_summary()
     with tab_leaderboard:
         render_leaderboard()
     with tab_roster:
