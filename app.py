@@ -480,18 +480,30 @@ def night_background_key(game_date: date) -> str:
 
 def selected_player_id(players: list[dict]) -> int:
     player_ids = {player["id"] for player in players}
+    try:
+        requested_id = int(st.query_params.get("player_id"))
+    except (TypeError, ValueError):
+        requested_id = None
+
+    if requested_id in player_ids:
+        st.session_state.active_player_id = requested_id
+        return requested_id
+
     active_player_id = st.session_state.get("active_player_id")
     if active_player_id in player_ids:
         return active_player_id
 
-    try:
-        requested_id = int(st.query_params.get("player_id", players[0]["id"]))
-    except (TypeError, ValueError):
-        requested_id = players[0]["id"]
-
-    selected_id = requested_id if requested_id in player_ids else players[0]["id"]
+    selected_id = players[0]["id"]
     st.session_state.active_player_id = selected_id
     return selected_id
+
+
+def photo_src(player: dict) -> str:
+    if not player.get("photo_blob"):
+        return ""
+    mime_type = player.get("photo_mime") or "image/png"
+    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def render_player_picker(
@@ -521,38 +533,28 @@ def render_player_picker(
         st.query_params["player_id"] = str(selected_id)
         st.rerun()
 
-    for row_start in range(0, len(players), 2):
-        cols = st.columns(2)
-        for offset, player in enumerate(players[row_start : row_start + 2]):
-            color = PLAYER_COLORS[(row_start + offset) % len(PLAYER_COLORS)]
-            selected = player["id"] == current_player_id
-            label = f"{player['name']}"
-            if selected:
-                label = f"Selected: {label}"
-            if player_badges.get(player["id"]):
-                label = f"{label}\n{player_badges[player['id']]}"
-            safe_label = html.escape(label).replace("\n", "<br>")
+    cards = []
+    for index, player in enumerate(players):
+        color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
+        selected_class = " selected" if player["id"] == current_player_id else ""
+        safe_name = html.escape(player["name"])
+        badge = player_badges.get(player["id"], "")
+        safe_badge = f"<span>{html.escape(badge)}</span>" if badge else ""
+        src = photo_src(player)
+        photo = (
+            f'<img src="{src}" alt="{safe_name}">'
+            if src
+            else '<div class="player-tile-placeholder">+</div>'
+        )
+        entry_param = "&entry=1" if lock_on_pick else ""
+        cards.append(
+            f'<a class="player-tile{selected_class}" href="?player_id={player["id"]}{entry_param}">'
+            f'<div class="player-tile-photo">{photo}</div>'
+            f'<div class="player-tile-name" style="color:{color};">{safe_name}{safe_badge}</div>'
+            '</a>'
+        )
 
-            with cols[offset]:
-                with st.container(border=True):
-                    tile_cols = st.columns([1, 3])
-                    with tile_cols[0]:
-                        render_photo(player, size=72)
-                    with tile_cols[1]:
-                        st.markdown(
-                            f"""
-                            <div class="player-name" style="color:{color};">
-                                {safe_label}
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                    if st.button("Choose", key=f"{scope}_pick_{player['id']}", use_container_width=True):
-                        st.session_state.active_player_id = player["id"]
-                        if lock_on_pick:
-                            st.session_state[f"{scope}_player_locked"] = True
-                        st.query_params["player_id"] = str(player["id"])
-                        st.rerun()
+    st.markdown(f'<div class="player-tile-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -723,6 +725,8 @@ def render_game_night(players: list[dict]) -> None:
     game_date = st.date_input("Playing date", value=date.today(), key="playing_date")
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
+    if st.query_params.get("entry") == "1":
+        st.session_state.game_night_player_locked = True
     current_player = next(player for player in players if player["id"] == current_player_id)
     player_games = stats_by_game(game_date, current_player_id)
     next_game = max(player_games.keys(), default=0) + 1
@@ -732,7 +736,7 @@ def render_game_night(players: list[dict]) -> None:
         st.session_state[game_key] = next_game
 
     if not st.session_state.get("game_night_player_locked", False):
-        st.caption("Pick your name, then enter one game at a time. The next game opens automatically after saving.")
+        st.caption("Tap your photo or name, then enter one game at a time. The next game opens automatically after saving.")
         render_player_picker(
             players,
             current_player_id,
@@ -744,6 +748,7 @@ def render_game_night(players: list[dict]) -> None:
 
     if st.button("Change Player", key="game_night_change_player"):
         st.session_state.game_night_player_locked = False
+        st.query_params.clear()
         st.rerun()
 
     with st.container(border=True):
@@ -1080,12 +1085,61 @@ def inject_css(background_url: str = "") -> None:
             font-size: 1.05rem;
             font-weight: 800;
         }
-        .player-name {
-            font-size: 1.35rem;
-            font-weight: 900;
-            line-height: 1.15;
-            margin-top: 0.35rem;
+        .player-tile-grid {
+            display: grid;
+            gap: 0.75rem;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            margin: 0.75rem 0 1rem;
+        }
+        .player-tile {
+            align-items: center;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            display: grid;
+            gap: 0.85rem;
+            grid-template-columns: 72px minmax(0, 1fr);
+            min-height: 92px;
+            padding: 0.65rem;
+            text-decoration: none !important;
+        }
+        .player-tile.selected {
+            border: 3px solid #ffffff;
+            padding: calc(0.65rem - 2px);
+        }
+        .player-tile-photo,
+        .player-tile-photo img,
+        .player-tile-placeholder {
+            height: 72px;
+            width: 72px;
+        }
+        .player-tile-photo img {
+            border-radius: 8px;
+            object-fit: cover;
+        }
+        .player-tile-placeholder {
+            align-items: center;
+            background: #f3f4f6;
+            border: 2px dashed #a3a3a3;
+            border-radius: 8px;
+            color: #737373;
+            display: flex;
+            font-size: 1.75rem;
+            font-weight: 800;
+            justify-content: center;
+        }
+        .player-tile-name {
+            font-size: 1.45rem;
+            font-weight: 950;
+            line-height: 1.12;
             overflow-wrap: anywhere;
+        }
+        .player-tile-name span {
+            color: #d4d4d4;
+            display: block;
+            font-size: 0.82rem;
+            font-weight: 800;
+            margin-top: 0.2rem;
         }
         [data-testid="stMetric"] {
             background: #fafafa;
@@ -1127,7 +1181,10 @@ def inject_css(background_url: str = "") -> None:
                 min-height: 2.6rem;
                 white-space: normal;
             }
-            .player-name {
+            .player-tile-grid {
+                grid-template-columns: 1fr;
+            }
+            .player-tile-name {
                 font-size: 1.15rem;
             }
         }
