@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -81,6 +82,15 @@ BACKGROUND_KEYS = {
     "winning": "Winning-night background",
     "losing": "Losing-night background",
 }
+PLAYER_COLORS = [
+    "#ef4444",
+    "#3b82f6",
+    "#22c55e",
+    "#f59e0b",
+    "#a855f7",
+    "#06b6d4",
+    "#f97316",
+]
 
 
 st.set_page_config(
@@ -508,17 +518,36 @@ def render_player_picker(
         st.query_params["player_id"] = str(selected_id)
         st.rerun()
 
-    cols = st.columns(len(players))
-    for index, player in enumerate(players):
-        with cols[index]:
-            render_photo(player, size=86)
+    for row_start in range(0, len(players), 2):
+        cols = st.columns(2)
+        for offset, player in enumerate(players[row_start : row_start + 2]):
+            color = PLAYER_COLORS[(row_start + offset) % len(PLAYER_COLORS)]
+            selected = player["id"] == current_player_id
+            label = f"{player['name']}"
+            if selected:
+                label = f"Selected: {label}"
             if player_badges.get(player["id"]):
-                st.caption(player_badges[player["id"]])
-            button_label = f"Selected: {player['name']}" if player["id"] == current_player_id else player["name"]
-            if st.button(button_label, key=f"{scope}_pick_{player['id']}", use_container_width=True):
-                st.session_state.active_player_id = player["id"]
-                st.query_params["player_id"] = str(player["id"])
-                st.rerun()
+                label = f"{label}\n{player_badges[player['id']]}"
+            safe_label = html.escape(label).replace("\n", "<br>")
+
+            with cols[offset]:
+                with st.container(border=True):
+                    tile_cols = st.columns([1, 3])
+                    with tile_cols[0]:
+                        render_photo(player, size=72)
+                    with tile_cols[1]:
+                        st.markdown(
+                            f"""
+                            <div class="player-name" style="color:{color};">
+                                {safe_label}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    if st.button("Choose", key=f"{scope}_pick_{player['id']}", use_container_width=True):
+                        st.session_state.active_player_id = player["id"]
+                        st.query_params["player_id"] = str(player["id"])
+                        st.rerun()
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -1034,6 +1063,13 @@ def inject_css(background_url: str = "") -> None:
             font-size: 1.05rem;
             font-weight: 800;
         }
+        .player-name {
+            font-size: 1.35rem;
+            font-weight: 900;
+            line-height: 1.15;
+            margin-top: 0.35rem;
+            overflow-wrap: anywhere;
+        }
         [data-testid="stMetric"] {
             background: #fafafa;
             border: 1px solid #e5e7eb;
@@ -1073,6 +1109,9 @@ def inject_css(background_url: str = "") -> None:
             button {
                 min-height: 2.6rem;
                 white-space: normal;
+            }
+            .player-name {
+                font-size: 1.15rem;
             }
         }
         </style>
