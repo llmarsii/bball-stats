@@ -529,11 +529,7 @@ def render_player_picker(
         0,
     )
     player_by_id = {player["id"]: player for player in players}
-    picker_key = f"{scope}_player_select"
-    sync_key = f"{scope}_player_select_synced"
-    if st.session_state.get(sync_key) != current_player_id:
-        st.session_state[picker_key] = current_player_id
-        st.session_state[sync_key] = current_player_id
+    picker_key = f"{scope}_player_select_{current_player_id}"
     selected_id = st.selectbox(
         "Player",
         options=[player["id"] for player in players],
@@ -543,7 +539,6 @@ def render_player_picker(
     )
     if selected_id != current_player_id:
         st.session_state.active_player_id = selected_id
-        st.session_state[sync_key] = selected_id
         st.query_params["player_id"] = str(selected_id)
         st.rerun()
 
