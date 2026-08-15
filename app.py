@@ -1145,10 +1145,20 @@ def inject_css(background_url: str = "") -> None:
             margin-top: 0.2rem;
         }
         [data-testid="stMetric"] {
-            background: #fafafa;
-            border: 1px solid #e5e7eb;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.16);
             border-radius: 8px;
             padding: 0.75rem;
+        }
+        [data-testid="stMetric"] label,
+        [data-testid="stMetric"] [data-testid="stMetricLabel"],
+        [data-testid="stMetric"] [data-testid="stMetricValue"],
+        [data-testid="stMetric"] p {
+            color: #f9fafb !important;
+        }
+        [data-testid="stMetric"] label,
+        [data-testid="stMetric"] [data-testid="stMetricLabel"] {
+            opacity: 0.78;
         }
         h1, h2, h3 {
             letter-spacing: 0;
