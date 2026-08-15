@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import sqlite3
 from datetime import date, datetime
@@ -76,6 +77,11 @@ PLAYER_NIGHT_COLUMNS = {
     "game_date": "Date",
     **NIGHTLY_TOTAL_COLUMNS,
 }
+BACKGROUND_KEYS = {
+    "neutral": "Neutral background",
+    "winning": "Winning-night background",
+    "losing": "Losing-night background",
+}
 
 
 st.set_page_config(
@@ -114,6 +120,19 @@ def create_game_stats_table(conn: sqlite3.Connection) -> None:
             notes TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL,
             PRIMARY KEY (game_date, game_number, player_id)
+        )
+        """
+    )
+
+
+def create_app_assets_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_assets (
+            asset_key TEXT PRIMARY KEY,
+            image_blob BLOB NOT NULL,
+            image_mime TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
         """
     )
@@ -187,6 +206,7 @@ def init_db() -> None:
             """
         )
         create_game_stats_table(conn)
+        create_app_assets_table(conn)
         ensure_game_stats_schema(conn)
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
@@ -284,6 +304,50 @@ def remove_player_photo(player_id: int) -> None:
             (datetime.utcnow().isoformat(), player_id),
         )
     get_players.clear()
+
+
+@st.cache_data(ttl=2)
+def get_background_asset(asset_key: str) -> dict | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT image_blob, image_mime
+            FROM app_assets
+            WHERE asset_key = ?
+            """,
+            (asset_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_assets (asset_key, image_blob, image_mime, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(asset_key) DO UPDATE SET
+                image_blob = excluded.image_blob,
+                image_mime = excluded.image_mime,
+                updated_at = excluded.updated_at
+            """,
+            (asset_key, image_bytes, mime_type, datetime.utcnow().isoformat()),
+        )
+    get_background_asset.clear()
+
+
+def remove_background_asset(asset_key: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM app_assets WHERE asset_key = ?", (asset_key,))
+    get_background_asset.clear()
+
+
+def background_data_url(asset_key: str) -> str:
+    asset = get_background_asset(asset_key) or get_background_asset("neutral")
+    if not asset:
+        return ""
+    encoded = base64.b64encode(asset["image_blob"]).decode("ascii")
+    return f"data:{asset['image_mime']};base64,{encoded}"
 
 
 def stats_for_date(game_date: date) -> list[dict]:
@@ -419,14 +483,39 @@ def format_game_date(game_date: date) -> str:
     return f"{game_date:%b} {game_date.day}, {game_date:%Y}"
 
 
+def active_background_date() -> date:
+    value = st.session_state.get("playing_date") or st.session_state.get("summary_date")
+    return value if isinstance(value, date) else date.today()
+
+
+def night_background_key(game_date: date) -> str:
+    df = all_stats()
+    if df.empty:
+        return "neutral"
+    rows = df[df["game_date"] == game_date.isoformat()]
+    wins = int((rows["result"] == "W").sum())
+    losses = int((rows["result"] == "L").sum())
+    if wins > losses:
+        return "winning"
+    if losses > wins:
+        return "losing"
+    return "neutral"
+
+
 def selected_player_id(players: list[dict]) -> int:
+    player_ids = {player["id"] for player in players}
+    active_player_id = st.session_state.get("active_player_id")
+    if active_player_id in player_ids:
+        return active_player_id
+
     try:
         requested_id = int(st.query_params.get("player_id", players[0]["id"]))
     except (TypeError, ValueError):
         requested_id = players[0]["id"]
 
-    player_ids = {player["id"] for player in players}
-    return requested_id if requested_id in player_ids else players[0]["id"]
+    selected_id = requested_id if requested_id in player_ids else players[0]["id"]
+    st.session_state.active_player_id = selected_id
+    return selected_id
 
 
 def render_player_picker(
@@ -435,6 +524,29 @@ def render_player_picker(
     player_badges: dict[int, str],
     scope: str,
 ) -> None:
+    current_index = next(
+        (index for index, player in enumerate(players) if player["id"] == current_player_id),
+        0,
+    )
+    player_by_id = {player["id"]: player for player in players}
+    picker_key = f"{scope}_player_select"
+    sync_key = f"{scope}_player_select_synced"
+    if st.session_state.get(sync_key) != current_player_id:
+        st.session_state[picker_key] = current_player_id
+        st.session_state[sync_key] = current_player_id
+    selected_id = st.selectbox(
+        "Player",
+        options=[player["id"] for player in players],
+        index=current_index,
+        key=picker_key,
+        format_func=lambda player_id: player_by_id[player_id]["name"],
+    )
+    if selected_id != current_player_id:
+        st.session_state.active_player_id = selected_id
+        st.session_state[sync_key] = selected_id
+        st.query_params["player_id"] = str(selected_id)
+        st.rerun()
+
     cols = st.columns(len(players))
     for index, player in enumerate(players):
         with cols[index]:
@@ -443,6 +555,7 @@ def render_player_picker(
                 st.caption(player_badges[player["id"]])
             button_label = f"Selected: {player['name']}" if player["id"] == current_player_id else player["name"]
             if st.button(button_label, key=f"{scope}_pick_{player['id']}", use_container_width=True):
+                st.session_state.active_player_id = player["id"]
                 st.query_params["player_id"] = str(player["id"])
                 st.rerun()
 
@@ -612,7 +725,7 @@ def render_saved_stat_line(player: dict, game_date: date, game_number: int, stat
 
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
-    game_date = st.date_input("Playing date", value=date.today())
+    game_date = st.date_input("Playing date", value=date.today(), key="playing_date")
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
@@ -761,6 +874,34 @@ def render_player_page(players: list[dict]) -> None:
         st.dataframe(game_display, use_container_width=True, hide_index=True)
 
 
+def render_backgrounds() -> None:
+    st.subheader("Backgrounds")
+    st.caption("Upload one neutral image, one winning-night image, and one losing-night image.")
+    current_date = active_background_date()
+    current_key = night_background_key(current_date)
+    st.info(f"Current background for {format_game_date(current_date)}: {BACKGROUND_KEYS[current_key]}")
+
+    for asset_key, label in BACKGROUND_KEYS.items():
+        with st.container(border=True):
+            st.markdown(f"### {label}")
+            asset = get_background_asset(asset_key)
+            if asset:
+                st.image(asset["image_blob"], use_container_width=True)
+            uploaded = st.file_uploader(
+                f"Upload {label.lower()}",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"background_{asset_key}",
+            )
+            if uploaded is not None:
+                update_background_asset(asset_key, uploaded.getvalue(), uploaded.type)
+                st.success(f"Saved {label}.")
+                st.rerun()
+            if asset and st.button(f"Remove {label}", key=f"remove_background_{asset_key}"):
+                remove_background_asset(asset_key)
+                st.success(f"Removed {label}.")
+                st.rerun()
+
+
 def render_leaderboard() -> None:
     st.subheader("Leaderboards")
     df = all_stats()
@@ -857,10 +998,24 @@ def render_roster(players: list[dict]) -> None:
                     st.rerun()
 
 
-def inject_css() -> None:
+def inject_css(background_url: str = "") -> None:
+    background_css = ""
+    if background_url:
+        background_css = f"""
+        .stApp {{
+            background-image:
+                linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9)),
+                url("{background_url}");
+            background-attachment: fixed;
+            background-position: center;
+            background-size: cover;
+        }}
+        """
+
     st.markdown(
         """
         <style>
+        __BACKGROUND_CSS__
         .block-container {
             padding-top: 1.6rem;
             padding-bottom: 2.5rem;
@@ -927,15 +1082,48 @@ def inject_css() -> None:
         h1, h2, h3 {
             letter-spacing: 0;
         }
+        @media (max-width: 640px) {
+            .block-container {
+                padding-left: 0.8rem;
+                padding-right: 0.8rem;
+                padding-top: 1rem;
+            }
+            div[data-testid="stHorizontalBlock"] {
+                gap: 0.45rem;
+            }
+            div[data-testid="stMetric"] {
+                padding: 0.5rem;
+            }
+            div[data-testid="stMetric"] label,
+            div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+                font-size: 0.85rem;
+            }
+            div[data-testid="stFileUploader"],
+            div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
+            div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {
+                height: 92px;
+                min-height: 92px;
+                width: 92px;
+            }
+            .photo-placeholder {
+                max-height: 92px;
+                max-width: 92px;
+            }
+            button {
+                min-height: 2.6rem;
+                white-space: normal;
+            }
+        }
         </style>
-        """,
+        """.replace("__BACKGROUND_CSS__", background_css),
         unsafe_allow_html=True,
     )
 
 
 def main() -> None:
     init_db()
-    inject_css()
+    background_key = night_background_key(active_background_date())
+    inject_css(background_data_url(background_key))
     if not require_password():
         return
 
@@ -949,8 +1137,8 @@ def main() -> None:
             st.session_state.authenticated = False
             st.rerun()
 
-    tab_game, tab_player, tab_summary, tab_leaderboard, tab_roster = st.tabs(
-        ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Roster"]
+    tab_game, tab_player, tab_summary, tab_leaderboard, tab_backgrounds, tab_roster = st.tabs(
+        ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Backgrounds", "Roster"]
     )
     with tab_game:
         render_game_night(players)
@@ -960,6 +1148,8 @@ def main() -> None:
         render_nightly_summary()
     with tab_leaderboard:
         render_leaderboard()
+    with tab_backgrounds:
+        render_backgrounds()
     with tab_roster:
         render_roster(players)
 

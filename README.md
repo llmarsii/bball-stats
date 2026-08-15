@@ -19,6 +19,16 @@ http://localhost:8765
 
 That avoids Streamlit's default `8501` port, which is commonly used by other local dashboards.
 
+## Background images
+
+Use the `Backgrounds` tab in the app to upload three optional images:
+
+- Neutral background
+- Winning-night background
+- Losing-night background
+
+The app chooses the winning or losing background from the selected night's total W/L count. If the night is tied or no stats have been entered, it uses the neutral background.
+
 ## Deploy free on Streamlit Community Cloud
 
 Streamlit Community Cloud currently describes app hosting as free and deploys directly from GitHub. To publish this so everyone can use it from their phones:
@@ -40,4 +50,4 @@ APP_PASSWORD = "choose-a-real-group-password"
 
 ## Data storage note
 
-Stats and profile photos are stored in a local SQLite database at `data/basketball_stats.sqlite3`. This is intentionally lightweight and fine for a small group, but hosted filesystem persistence can be less durable than a real database. If you want stronger long-term persistence later, the app can be moved to a free hosted backend such as Supabase or Google Sheets.
+Stats, profile photos, and background images are stored in a local SQLite database at `data/basketball_stats.sqlite3`. This is intentionally lightweight and fine for a small group, but hosted filesystem persistence can be less durable than a real database. If you want stronger long-term persistence later, the app can be moved to a free hosted backend such as Supabase or Google Sheets.
