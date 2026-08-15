@@ -412,6 +412,18 @@ def render_photo(player: dict, size: int = 96) -> None:
     )
 
 
+def render_photo_upload_control(player: dict, key: str, size: int = 112) -> object | None:
+    if player.get("photo_blob"):
+        render_photo(player, size=size)
+        st.caption("Tap + to replace")
+    return st.file_uploader(
+        "+ profile photo",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=key,
+        label_visibility="collapsed",
+    )
+
+
 def render_stat_form(player: dict, game_date: date, stats: dict) -> None:
     result_options = ["", "W", "L"]
     current_result = stats.get("result", "")
@@ -509,18 +521,17 @@ def render_game_night(players: list[dict]) -> None:
     with st.container(border=True):
         top_cols = st.columns([1, 4])
         with top_cols[0]:
-            render_photo(current_player, size=112)
-        with top_cols[1]:
-            st.markdown(f"### {current_player['name']}")
-            uploaded = st.file_uploader(
-                "+ profile photo",
-                type=["png", "jpg", "jpeg", "webp"],
+            uploaded = render_photo_upload_control(
+                current_player,
                 key=f"photo_{current_player['id']}",
+                size=112,
             )
             if uploaded is not None:
                 update_player_photo(current_player["id"], uploaded.getvalue(), uploaded.type)
                 st.success("Photo saved.")
                 st.rerun()
+        with top_cols[1]:
+            st.markdown(f"### {current_player['name']}")
 
         if current_stats and not st.session_state.get(edit_key, False):
             render_saved_stat_line(current_player, game_date, current_stats)
@@ -667,7 +678,15 @@ def render_roster(players: list[dict]) -> None:
         with st.container(border=True):
             cols = st.columns([1, 4, 2])
             with cols[0]:
-                render_photo(player, size=84)
+                uploaded = render_photo_upload_control(
+                    player,
+                    key=f"roster_photo_{player['id']}",
+                    size=84,
+                )
+                if uploaded is not None:
+                    update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+                    st.success("Photo saved.")
+                    st.rerun()
             with cols[1]:
                 new_name = st.text_input(
                     "Player name",
@@ -704,6 +723,41 @@ def inject_css() -> None:
             font-size: 2rem;
             font-weight: 700;
             justify-content: center;
+        }
+        div[data-testid="stFileUploader"] {
+            width: 112px;
+        }
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {
+            align-items: center;
+            background: #f3f4f6;
+            border: 2px dashed #a3a3a3;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            height: 112px;
+            justify-content: center;
+            min-height: 112px;
+            padding: 0;
+            position: relative;
+            width: 112px;
+        }
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {
+            color: #737373;
+            content: "+";
+            font-size: 2rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {
+            display: none;
+        }
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {
+            cursor: pointer;
+            height: 112px;
+            inset: 0;
+            opacity: 0;
+            position: absolute;
+            width: 112px;
         }
         .player-strip {
             display: flex;
