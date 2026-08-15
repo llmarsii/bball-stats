@@ -1,6 +1,6 @@
 # Pickup Basketball Stat Tracker
 
-A small Streamlit app for a seven-person pickup group. Everyone can open the shared page, enter the group password, choose the playing date, upload a headshot, save W/L plus box-score stats, and view leaderboards.
+A small Streamlit app for a seven-person pickup group. Everyone can open the shared page, enter the group password, choose the playing date, upload a headshot, save W/L plus box-score stats for each game, and view nightly totals plus leaderboards.
 
 ## Run locally
 

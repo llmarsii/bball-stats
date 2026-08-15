@@ -51,6 +51,33 @@ SUMMARY_COLUMNS = {
     "turnovers": "TO",
     "notes": "Notes",
 }
+GAME_LOG_COLUMNS = {
+    "game_number": "Game",
+    **SUMMARY_COLUMNS,
+}
+NIGHTLY_TOTAL_COLUMNS = {
+    "name": "Player",
+    "games": "Games",
+    "wins": "W",
+    "losses": "L",
+    "record": "W-L",
+    "points": "PTS",
+    "field_goals_made": "FGM",
+    "field_goals_attempted": "FGA",
+    "fg_pct": "FG%",
+    "threes": "3PM",
+    "three_attempts": "3PA",
+    "three_pct": "3P%",
+    "rebounds": "REB",
+    "assists": "AST",
+    "steals": "STL",
+    "blocks": "BLK",
+    "turnovers": "TO",
+}
+PLAYER_NIGHT_COLUMNS = {
+    "game_date": "Date",
+    **NIGHTLY_TOTAL_COLUMNS,
+}
 
 
 st.set_page_config(
@@ -68,6 +95,85 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def create_game_stats_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_stats (
+            game_date TEXT NOT NULL,
+            game_number INTEGER NOT NULL DEFAULT 1,
+            player_id INTEGER NOT NULL REFERENCES players(id),
+            result TEXT NOT NULL DEFAULT '',
+            points INTEGER NOT NULL DEFAULT 0,
+            field_goals_made INTEGER NOT NULL DEFAULT 0,
+            field_goals_attempted INTEGER NOT NULL DEFAULT 0,
+            rebounds INTEGER NOT NULL DEFAULT 0,
+            assists INTEGER NOT NULL DEFAULT 0,
+            steals INTEGER NOT NULL DEFAULT 0,
+            blocks INTEGER NOT NULL DEFAULT 0,
+            threes INTEGER NOT NULL DEFAULT 0,
+            three_attempts INTEGER NOT NULL DEFAULT 0,
+            turnovers INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (game_date, game_number, player_id)
+        )
+        """
+    )
+
+
+def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]: row for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
+    }
+    migrations = {
+        "field_goals_made": "INTEGER NOT NULL DEFAULT 0",
+        "field_goals_attempted": "INTEGER NOT NULL DEFAULT 0",
+        "three_attempts": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE game_stats ADD COLUMN {column} {definition}")
+
+    columns = {
+        row["name"]: row for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
+    }
+    if "game_number" in columns:
+        return
+
+    now = datetime.utcnow().isoformat()
+    conn.execute("ALTER TABLE game_stats RENAME TO game_stats_old")
+    create_game_stats_table(conn)
+    conn.execute(
+        """
+        INSERT INTO game_stats (
+            game_date, game_number, player_id, result, points, field_goals_made,
+            field_goals_attempted, rebounds, assists, steals, blocks, threes,
+            three_attempts, turnovers, notes, updated_at
+        )
+        SELECT
+            game_date,
+            1 AS game_number,
+            player_id,
+            result,
+            points,
+            field_goals_made,
+            field_goals_attempted,
+            rebounds,
+            assists,
+            steals,
+            blocks,
+            threes,
+            three_attempts,
+            turnovers,
+            notes,
+            COALESCE(updated_at, ?)
+        FROM game_stats_old
+        """,
+        (now,),
+    )
+    conn.execute("DROP TABLE game_stats_old")
+
+
 def init_db() -> None:
     with db() as conn:
         conn.execute(
@@ -82,39 +188,8 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS game_stats (
-                game_date TEXT NOT NULL,
-                player_id INTEGER NOT NULL REFERENCES players(id),
-                result TEXT NOT NULL DEFAULT '',
-                points INTEGER NOT NULL DEFAULT 0,
-                field_goals_made INTEGER NOT NULL DEFAULT 0,
-                field_goals_attempted INTEGER NOT NULL DEFAULT 0,
-                rebounds INTEGER NOT NULL DEFAULT 0,
-                assists INTEGER NOT NULL DEFAULT 0,
-                steals INTEGER NOT NULL DEFAULT 0,
-                blocks INTEGER NOT NULL DEFAULT 0,
-                threes INTEGER NOT NULL DEFAULT 0,
-                three_attempts INTEGER NOT NULL DEFAULT 0,
-                turnovers INTEGER NOT NULL DEFAULT 0,
-                notes TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (game_date, player_id)
-            )
-            """
-        )
-        existing_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
-        }
-        migrations = {
-            "field_goals_made": "INTEGER NOT NULL DEFAULT 0",
-            "field_goals_attempted": "INTEGER NOT NULL DEFAULT 0",
-            "three_attempts": "INTEGER NOT NULL DEFAULT 0",
-        }
-        for column, definition in migrations.items():
-            if column not in existing_columns:
-                conn.execute(f"ALTER TABLE game_stats ADD COLUMN {column} {definition}")
+        create_game_stats_table(conn)
+        ensure_game_stats_schema(conn)
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
             now = datetime.utcnow().isoformat()
@@ -213,31 +288,55 @@ def remove_player_photo(player_id: int) -> None:
     get_players.clear()
 
 
-def stats_for_date(game_date: date) -> dict[int, dict]:
+def stats_for_date(game_date: date) -> list[dict]:
     with db() as conn:
         rows = conn.execute(
             """
             SELECT *
             FROM game_stats
             WHERE game_date = ?
+            ORDER BY game_number, player_id
             """,
             (game_date.isoformat(),),
         ).fetchall()
-    return {row["player_id"]: dict(row) for row in rows}
+    return [dict(row) for row in rows]
 
 
-def save_stat_line(game_date: date, player_id: int, values: dict) -> None:
+def stats_by_game(game_date: date, player_id: int) -> dict[int, dict]:
+    return {
+        row["game_number"]: row
+        for row in stats_for_date(game_date)
+        if row["player_id"] == player_id
+    }
+
+
+def game_counts_for_date(game_date: date) -> dict[int, str]:
+    counts: dict[int, int] = {}
+    for row in stats_for_date(game_date):
+        counts[row["player_id"]] = counts.get(row["player_id"], 0) + 1
+    return {
+        player_id: f"{count} game" if count == 1 else f"{count} games"
+        for player_id, count in counts.items()
+    }
+
+
+def next_game_number(game_date: date, player_id: int) -> int:
+    player_games = stats_by_game(game_date, player_id)
+    return max(player_games.keys(), default=0) + 1
+
+
+def save_stat_line(game_date: date, game_number: int, player_id: int, values: dict) -> None:
     now = datetime.utcnow().isoformat()
     with db() as conn:
         conn.execute(
             """
             INSERT INTO game_stats (
-                game_date, player_id, result, points, field_goals_made,
+                game_date, game_number, player_id, result, points, field_goals_made,
                 field_goals_attempted, rebounds, assists, steals, blocks,
                 threes, three_attempts, turnovers, notes, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(game_date, player_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(game_date, game_number, player_id) DO UPDATE SET
                 result = excluded.result,
                 points = excluded.points,
                 field_goals_made = excluded.field_goals_made,
@@ -254,6 +353,7 @@ def save_stat_line(game_date: date, player_id: int, values: dict) -> None:
             """,
             (
                 game_date.isoformat(),
+                game_number,
                 player_id,
                 values["result"],
                 values["points"],
@@ -279,6 +379,7 @@ def all_stats() -> pd.DataFrame:
             """
             SELECT
                 gs.game_date,
+                gs.game_number,
                 p.name,
                 p.id AS player_id,
                 gs.result,
@@ -296,7 +397,7 @@ def all_stats() -> pd.DataFrame:
                 gs.updated_at
             FROM game_stats gs
             JOIN players p ON p.id = gs.player_id
-            ORDER BY gs.game_date DESC, p.sort_order, p.id
+            ORDER BY gs.game_date DESC, gs.game_number DESC, p.sort_order, p.id
             """,
             conn,
         )
@@ -338,13 +439,13 @@ def photo_src(player: dict) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def render_player_picker(players: list[dict], current_player_id: int, existing_stats: dict[int, dict]) -> None:
+def render_player_picker(players: list[dict], current_player_id: int, player_badges: dict[int, str]) -> None:
     cards = []
     for player in players:
         safe_name = html.escape(player["name"])
         active_class = " active" if player["id"] == current_player_id else ""
-        result = existing_stats.get(player["id"], {}).get("result", "")
-        saved_badge = f"<span class='saved-badge'>{result or 'Saved'}</span>" if player["id"] in existing_stats else ""
+        badge = player_badges.get(player["id"], "")
+        saved_badge = f"<span class='saved-badge'>{html.escape(badge)}</span>" if badge else ""
         src = photo_src(player)
         photo = (
             f"<img src='{src}' alt='{safe_name}'>"
@@ -390,7 +491,37 @@ def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def aggregate_player_totals(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    grouped = df.groupby(group_cols, as_index=False).agg(
+        games=("game_number", "count"),
+        wins=("result", lambda values: int((values == "W").sum())),
+        losses=("result", lambda values: int((values == "L").sum())),
+        points=("points", "sum"),
+        field_goals_made=("field_goals_made", "sum"),
+        field_goals_attempted=("field_goals_attempted", "sum"),
+        rebounds=("rebounds", "sum"),
+        assists=("assists", "sum"),
+        steals=("steals", "sum"),
+        blocks=("blocks", "sum"),
+        threes=("threes", "sum"),
+        three_attempts=("three_attempts", "sum"),
+        turnovers=("turnovers", "sum"),
+    )
+    grouped["record"] = grouped["wins"].astype(str) + "-" + grouped["losses"].astype(str)
+    return add_percentages(grouped)
+
+
 def nightly_summary(game_date: date) -> pd.DataFrame:
+    df = all_stats()
+    if df.empty:
+        return df
+    df = df[df["game_date"] == game_date.isoformat()].copy()
+    return aggregate_player_totals(df, ["player_id", "name"])
+
+
+def nightly_game_log(game_date: date) -> pd.DataFrame:
     df = all_stats()
     if df.empty:
         return df
@@ -424,20 +555,21 @@ def render_photo_upload_control(player: dict, key: str, size: int = 112) -> obje
     )
 
 
-def render_stat_form(player: dict, game_date: date, stats: dict) -> None:
+def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict) -> None:
     result_options = ["", "W", "L"]
     current_result = stats.get("result", "")
     result_index = result_options.index(current_result) if current_result in result_options else 0
 
-    with st.form(f"stat_form_{game_date}_{player['id']}"):
-        st.markdown(f"### {player['name']} stats for {format_game_date(game_date)}")
+    with st.form(f"stat_form_{game_date}_{game_number}_{player['id']}"):
+        st.markdown(f"### {player['name']} - Game {game_number}")
+        st.caption(format_game_date(game_date))
         result = st.radio(
             "Team result",
             options=result_options,
             index=result_index,
             horizontal=True,
             format_func=lambda option: "Unset" if option == "" else option,
-            key=f"result_{game_date}_{player['id']}",
+            key=f"result_{game_date}_{game_number}_{player['id']}",
         )
 
         stat_values = {"result": result}
@@ -446,7 +578,7 @@ def render_stat_form(player: dict, game_date: date, stats: dict) -> None:
             with first_row[index]:
                 stat_values[field] = stat_input(
                     STAT_FIELDS[field],
-                    f"{field}_{game_date}_{player['id']}",
+                    f"{field}_{game_date}_{game_number}_{player['id']}",
                     stats.get(field, 0),
                 )
 
@@ -455,32 +587,33 @@ def render_stat_form(player: dict, game_date: date, stats: dict) -> None:
             with second_row[index]:
                 stat_values[field] = stat_input(
                     STAT_FIELDS[field],
-                    f"{field}_{game_date}_{player['id']}",
+                    f"{field}_{game_date}_{game_number}_{player['id']}",
                     stats.get(field, 0),
                 )
 
         stat_values["notes"] = st.text_input(
             "Notes",
             value=stats.get("notes", ""),
-            key=f"notes_{game_date}_{player['id']}",
+            key=f"notes_{game_date}_{game_number}_{player['id']}",
             placeholder="Optional",
         )
         submitted = st.form_submit_button(
-            "Save Stat Line",
+            "Save Game",
             type="primary",
             use_container_width=True,
         )
 
     if submitted:
-        save_stat_line(game_date, player["id"], stat_values)
+        save_stat_line(game_date, game_number, player["id"], stat_values)
         all_stats.clear()
-        st.session_state[f"editing_{game_date}_{player['id']}"] = False
-        st.success(f"Saved {player['name']} for {format_game_date(game_date)}.")
+        st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = False
+        st.session_state[f"selected_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
+        st.success(f"Saved {player['name']} Game {game_number}.")
         st.rerun()
 
 
-def render_saved_stat_line(player: dict, game_date: date, stats: dict) -> None:
-    st.markdown(f"### {player['name']} stat line")
+def render_saved_stat_line(player: dict, game_date: date, game_number: int, stats: dict) -> None:
+    st.markdown(f"### {player['name']} - Game {game_number}")
     metric_cols = st.columns(5)
     metric_cols[0].metric("PTS", stats.get("points", 0))
     metric_cols[1].metric(
@@ -501,22 +634,26 @@ def render_saved_stat_line(player: dict, game_date: date, stats: dict) -> None:
     if stats.get("notes"):
         st.caption(f"Notes: {stats['notes']}")
 
-    if st.button("Edit Stat Line", key=f"edit_{game_date}_{player['id']}", type="primary", use_container_width=True):
-        st.session_state[f"editing_{game_date}_{player['id']}"] = True
+    if st.button("Edit Game Stats", key=f"edit_{game_date}_{game_number}_{player['id']}", type="primary", use_container_width=True):
+        st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = True
         st.rerun()
 
 
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
     game_date = st.date_input("Playing date", value=date.today())
-    existing_stats = stats_for_date(game_date)
+    player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
-    current_stats = existing_stats.get(current_player_id, {})
-    edit_key = f"editing_{game_date}_{current_player_id}"
+    player_games = stats_by_game(game_date, current_player_id)
+    next_game = max(player_games.keys(), default=0) + 1
+    game_options = sorted(player_games.keys()) + [next_game]
+    game_key = f"selected_game_{game_date}_{current_player_id}"
+    if st.session_state.get(game_key) not in game_options:
+        st.session_state[game_key] = next_game
 
-    st.caption("Pick your photo/name from the row, then enter or edit only your stat line.")
-    render_player_picker(players, current_player_id, existing_stats)
+    st.caption("Pick your photo/name from the row, enter one game at a time, then save. The next game opens automatically.")
+    render_player_picker(players, current_player_id, player_badges)
 
     with st.container(border=True):
         top_cols = st.columns([1, 4])
@@ -532,31 +669,50 @@ def render_game_night(players: list[dict]) -> None:
                 st.rerun()
         with top_cols[1]:
             st.markdown(f"### {current_player['name']}")
+            selected_game = st.selectbox(
+                "Game",
+                options=game_options,
+                key=game_key,
+                format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
+            )
+            current_stats = player_games.get(selected_game, {})
+            edit_key = f"editing_{game_date}_{selected_game}_{current_player_id}"
 
         if current_stats and not st.session_state.get(edit_key, False):
-            render_saved_stat_line(current_player, game_date, current_stats)
+            render_saved_stat_line(current_player, game_date, selected_game, current_stats)
         else:
-            render_stat_form(current_player, game_date, current_stats)
+            render_stat_form(current_player, game_date, selected_game, current_stats)
 
 
 def render_nightly_summary() -> None:
     st.subheader("Nightly Summary")
     game_date = st.date_input("Summary date", value=date.today(), key="summary_date")
     summary = nightly_summary(game_date)
+    game_log = nightly_game_log(game_date)
 
     if summary.empty:
         st.info(f"No stat lines saved for {format_game_date(game_date)} yet.")
         return
 
-    display = summary[list(SUMMARY_COLUMNS.keys())].rename(columns=SUMMARY_COLUMNS)
-    st.caption("Click any column header to sort the table.")
+    display = summary[list(NIGHTLY_TOTAL_COLUMNS.keys())].rename(columns=NIGHTLY_TOTAL_COLUMNS)
+    st.caption("Nightly totals across all games. Click any column header to sort.")
     st.dataframe(display, use_container_width=True, hide_index=True)
     st.download_button(
-        "Download Nightly CSV",
+        "Download Nightly Totals CSV",
         data=display.to_csv(index=False),
-        file_name=f"pickup_stats_{game_date.isoformat()}.csv",
+        file_name=f"pickup_totals_{game_date.isoformat()}.csv",
         mime="text/csv",
     )
+
+    with st.expander("Game-by-game log"):
+        game_display = game_log[list(GAME_LOG_COLUMNS.keys())].rename(columns=GAME_LOG_COLUMNS)
+        st.dataframe(game_display, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Game Log CSV",
+            data=game_display.to_csv(index=False),
+            file_name=f"pickup_games_{game_date.isoformat()}.csv",
+            mime="text/csv",
+        )
 
 
 def player_history(player_id: int) -> pd.DataFrame:
@@ -564,8 +720,16 @@ def player_history(player_id: int) -> pd.DataFrame:
     if df.empty:
         return df
     df = df[df["player_id"] == player_id].copy()
+    return aggregate_player_totals(df, ["game_date", "player_id", "name"]).sort_values("game_date", ascending=False)
+
+
+def player_game_log(player_id: int) -> pd.DataFrame:
+    df = all_stats()
+    if df.empty:
+        return df
+    df = df[df["player_id"] == player_id].copy()
     df = add_percentages(df)
-    return df.sort_values("game_date", ascending=False)
+    return df.sort_values(["game_date", "game_number"], ascending=[False, False])
 
 
 def csv_safe_name(name: str) -> str:
@@ -591,19 +755,18 @@ def render_player_page(players: list[dict]) -> None:
         st.info(f"No stat lines saved for {current_player['name']} yet.")
         return
 
-    completed = history[history["result"].isin(["W", "L"])]
     metric_cols = st.columns(4)
-    metric_cols[0].metric("Games", history["game_date"].nunique())
-    metric_cols[1].metric("Wins", int((completed["result"] == "W").sum()))
-    metric_cols[2].metric("PPG", round(history["points"].mean(), 1))
-    metric_cols[3].metric("RPG", round(history["rebounds"].mean(), 1))
+    total_games = int(history["games"].sum())
+    metric_cols[0].metric("Games", total_games)
+    metric_cols[1].metric("Wins", int(history["wins"].sum()))
+    metric_cols[2].metric("PPG", round(history["points"].sum() / total_games, 1))
+    metric_cols[3].metric("RPG", round(history["rebounds"].sum() / total_games, 1))
 
-    display_columns = ["game_date", *SUMMARY_COLUMNS.keys()]
+    display_columns = list(PLAYER_NIGHT_COLUMNS.keys())
     display_columns.remove("name")
     display = history[display_columns].rename(
         columns={
-            "game_date": "Date",
-            **SUMMARY_COLUMNS,
+            **PLAYER_NIGHT_COLUMNS,
         }
     )
     st.dataframe(display, use_container_width=True, hide_index=True)
@@ -613,6 +776,18 @@ def render_player_page(players: list[dict]) -> None:
         file_name=f"{csv_safe_name(current_player['name'])}_stats.csv",
         mime="text/csv",
     )
+
+    with st.expander("Game-by-game log"):
+        games = player_game_log(current_player_id)
+        game_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
+        game_columns.remove("name")
+        game_display = games[game_columns].rename(
+            columns={
+                "game_date": "Date",
+                **GAME_LOG_COLUMNS,
+            }
+        )
+        st.dataframe(game_display, use_container_width=True, hide_index=True)
 
 
 def render_leaderboard() -> None:
@@ -629,7 +804,8 @@ def render_leaderboard() -> None:
         return
 
     grouped = completed.groupby("name", as_index=False).agg(
-        GP=("game_date", "nunique"),
+        GP=("game_number", "count"),
+        Nights=("game_date", "nunique"),
         W=("result", lambda values: int((values == "W").sum())),
         L=("result", lambda values: int((values == "L").sum())),
         PTS=("points", "sum"),
@@ -660,11 +836,17 @@ def render_leaderboard() -> None:
     st.dataframe(grouped, use_container_width=True, hide_index=True)
 
     with st.expander("All saved stat lines"):
-        display_df = add_percentages(df).rename(columns=SUMMARY_COLUMNS)
+        display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
+        display_df = add_percentages(df)[display_columns].rename(
+            columns={
+                "game_date": "Date",
+                **GAME_LOG_COLUMNS,
+            }
+        )
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         st.download_button(
             "Download CSV",
-            data=df.to_csv(index=False),
+            data=display_df.to_csv(index=False),
             file_name="pickup_basketball_stats.csv",
             mime="text/csv",
         )
