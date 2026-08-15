@@ -688,7 +688,7 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
         save_stat_line(game_date, game_number, player["id"], stat_values)
         all_stats.clear()
         st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = False
-        st.session_state[f"selected_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
+        st.session_state[f"pending_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
         st.success(f"Saved {player['name']} Game {game_number}.")
         st.rerun()
 
@@ -732,6 +732,9 @@ def render_game_night(players: list[dict]) -> None:
     next_game = max(player_games.keys(), default=0) + 1
     game_options = sorted(player_games.keys()) + [next_game]
     game_key = f"selected_game_{game_date}_{current_player_id}"
+    pending_game_key = f"pending_game_{game_date}_{current_player_id}"
+    if st.session_state.get(pending_game_key) in game_options:
+        st.session_state[game_key] = st.session_state.pop(pending_game_key)
     if st.session_state.get(game_key) not in game_options:
         st.session_state[game_key] = next_game
 
