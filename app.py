@@ -499,6 +499,7 @@ def render_player_picker(
     current_player_id: int,
     player_badges: dict[int, str],
     scope: str,
+    lock_on_pick: bool = False,
 ) -> None:
     current_index = next(
         (index for index, player in enumerate(players) if player["id"] == current_player_id),
@@ -515,6 +516,8 @@ def render_player_picker(
     )
     if selected_id != current_player_id:
         st.session_state.active_player_id = selected_id
+        if lock_on_pick:
+            st.session_state[f"{scope}_player_locked"] = True
         st.query_params["player_id"] = str(selected_id)
         st.rerun()
 
@@ -546,6 +549,8 @@ def render_player_picker(
                         )
                     if st.button("Choose", key=f"{scope}_pick_{player['id']}", use_container_width=True):
                         st.session_state.active_player_id = player["id"]
+                        if lock_on_pick:
+                            st.session_state[f"{scope}_player_locked"] = True
                         st.query_params["player_id"] = str(player["id"])
                         st.rerun()
 
@@ -726,8 +731,20 @@ def render_game_night(players: list[dict]) -> None:
     if st.session_state.get(game_key) not in game_options:
         st.session_state[game_key] = next_game
 
-    st.caption("Pick your photo/name from the row, enter one game at a time, then save. The next game opens automatically.")
-    render_player_picker(players, current_player_id, player_badges, scope="game_night")
+    if not st.session_state.get("game_night_player_locked", False):
+        st.caption("Pick your name, then enter one game at a time. The next game opens automatically after saving.")
+        render_player_picker(
+            players,
+            current_player_id,
+            player_badges,
+            scope="game_night",
+            lock_on_pick=True,
+        )
+        return
+
+    if st.button("Change Player", key="game_night_change_player"):
+        st.session_state.game_night_player_locked = False
+        st.rerun()
 
     with st.container(border=True):
         top_cols = st.columns([1, 4])
