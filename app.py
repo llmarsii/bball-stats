@@ -410,6 +410,20 @@ def save_stat_line(game_date: date, game_number: int, player_id: int, values: di
         )
 
 
+def delete_stat_line(game_date: date, game_number: int, player_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            DELETE FROM game_stats
+            WHERE game_date = ?
+              AND game_number = ?
+              AND player_id = ?
+            """,
+            (game_date.isoformat(), game_number, player_id),
+        )
+    all_stats.clear()
+
+
 @st.cache_data(ttl=2)
 def all_stats() -> pd.DataFrame:
     with db() as conn:
@@ -715,9 +729,28 @@ def render_saved_stat_line(player: dict, game_date: date, game_number: int, stat
     if stats.get("notes"):
         st.caption(f"Notes: {stats['notes']}")
 
-    if st.button("Edit Game Stats", key=f"edit_{game_date}_{game_number}_{player['id']}", type="primary", use_container_width=True):
-        st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = True
-        st.rerun()
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button("Edit Game Stats", key=f"edit_{game_date}_{game_number}_{player['id']}", type="primary", use_container_width=True):
+            st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = True
+            st.rerun()
+    with action_cols[1]:
+        confirm_key = f"confirm_delete_{game_date}_{game_number}_{player['id']}"
+        confirmed = st.checkbox(
+            f"Confirm delete Game {game_number}",
+            key=confirm_key,
+        )
+        if st.button(
+            "Delete Game Stats",
+            key=f"delete_{game_date}_{game_number}_{player['id']}",
+            disabled=not confirmed,
+            use_container_width=True,
+        ):
+            delete_stat_line(game_date, game_number, player["id"])
+            st.session_state.pop(confirm_key, None)
+            st.session_state[f"pending_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
+            st.success(f"Deleted {player['name']} Game {game_number}.")
+            st.rerun()
 
 
 def render_game_night(players: list[dict]) -> None:
