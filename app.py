@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import html
 import os
 import sqlite3
 from datetime import date, datetime
@@ -431,45 +429,22 @@ def selected_player_id(players: list[dict]) -> int:
     return requested_id if requested_id in player_ids else players[0]["id"]
 
 
-def photo_src(player: dict) -> str:
-    if not player.get("photo_blob"):
-        return ""
-    mime_type = player.get("photo_mime") or "image/png"
-    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def render_player_picker(players: list[dict], current_player_id: int, player_badges: dict[int, str]) -> None:
-    cards = []
-    for player in players:
-        safe_name = html.escape(player["name"])
-        active_class = " active" if player["id"] == current_player_id else ""
-        badge = player_badges.get(player["id"], "")
-        saved_badge = f"<span class='saved-badge'>{html.escape(badge)}</span>" if badge else ""
-        src = photo_src(player)
-        photo = (
-            f"<img src='{src}' alt='{safe_name}'>"
-            if src
-            else "<div class='picker-placeholder'>+</div>"
-        )
-        cards.append(
-            f"""
-            <a class="player-card{active_class}" href="?player_id={player['id']}">
-                <div class="picker-photo">{photo}</div>
-                <div class="picker-name">{safe_name}</div>
-                {saved_badge}
-            </a>
-            """
-        )
-
-    st.markdown(
-        f"""
-        <div class="player-strip">
-            {''.join(cards)}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def render_player_picker(
+    players: list[dict],
+    current_player_id: int,
+    player_badges: dict[int, str],
+    scope: str,
+) -> None:
+    cols = st.columns(len(players))
+    for index, player in enumerate(players):
+        with cols[index]:
+            render_photo(player, size=86)
+            if player_badges.get(player["id"]):
+                st.caption(player_badges[player["id"]])
+            button_label = f"Selected: {player['name']}" if player["id"] == current_player_id else player["name"]
+            if st.button(button_label, key=f"{scope}_pick_{player['id']}", use_container_width=True):
+                st.query_params["player_id"] = str(player["id"])
+                st.rerun()
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -534,11 +509,7 @@ def render_photo(player: dict, size: int = 96) -> None:
         st.image(player["photo_blob"], width=size)
         return
     st.markdown(
-        f"""
-        <div class="photo-placeholder" style="width:{size}px;height:{size}px;">
-            +
-        </div>
-        """,
+        f'<div class="photo-placeholder" style="width:{size}px;height:{size}px;">+</div>',
         unsafe_allow_html=True,
     )
 
@@ -653,7 +624,7 @@ def render_game_night(players: list[dict]) -> None:
         st.session_state[game_key] = next_game
 
     st.caption("Pick your photo/name from the row, enter one game at a time, then save. The next game opens automatically.")
-    render_player_picker(players, current_player_id, player_badges)
+    render_player_picker(players, current_player_id, player_badges, scope="game_night")
 
     with st.container(border=True):
         top_cols = st.columns([1, 4])
@@ -741,7 +712,7 @@ def render_player_page(players: list[dict]) -> None:
     st.subheader("Player Page")
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
-    render_player_picker(players, current_player_id, {})
+    render_player_picker(players, current_player_id, {}, scope="player_page")
 
     header_cols = st.columns([1, 4])
     with header_cols[0]:
@@ -940,72 +911,6 @@ def inject_css() -> None:
             opacity: 0;
             position: absolute;
             width: 112px;
-        }
-        .player-strip {
-            display: flex;
-            gap: 0.75rem;
-            margin: 0.75rem 0 1rem;
-            overflow-x: auto;
-            padding: 0.25rem 0 0.75rem;
-        }
-        .player-card {
-            align-items: center;
-            border: 1px solid #d4d4d4;
-            border-radius: 8px;
-            color: #171717 !important;
-            display: flex;
-            flex: 0 0 128px;
-            flex-direction: column;
-            gap: 0.4rem;
-            min-height: 156px;
-            padding: 0.65rem;
-            position: relative;
-            text-align: center;
-            text-decoration: none !important;
-        }
-        .player-card.active {
-            border: 3px solid #ef4444;
-            padding: calc(0.65rem - 2px);
-        }
-        .picker-photo,
-        .picker-photo img,
-        .picker-placeholder {
-            height: 86px;
-            width: 86px;
-        }
-        .picker-photo img {
-            border-radius: 8px;
-            object-fit: cover;
-        }
-        .picker-placeholder {
-            align-items: center;
-            background: #f3f4f6;
-            border: 2px dashed #a3a3a3;
-            border-radius: 8px;
-            color: #737373;
-            display: flex;
-            font-size: 2rem;
-            font-weight: 700;
-            justify-content: center;
-        }
-        .picker-name {
-            font-size: 0.9rem;
-            font-weight: 700;
-            line-height: 1.15;
-            max-width: 100%;
-            overflow-wrap: anywhere;
-        }
-        .saved-badge {
-            background: #171717;
-            border-radius: 999px;
-            color: #ffffff;
-            font-size: 0.7rem;
-            font-weight: 700;
-            line-height: 1;
-            padding: 0.25rem 0.45rem;
-            position: absolute;
-            right: 0.35rem;
-            top: 0.35rem;
         }
         div[data-testid="stFormSubmitButton"] button[kind="primary"],
         div[data-testid="stButton"] button[kind="primary"] {
