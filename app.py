@@ -2,16 +2,36 @@ from __future__ import annotations
 
 import base64
 import html
+import json
+import os
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:  # Local SQLite mode does not require Postgres dependencies.
+    psycopg2 = None
+    DictCursor = None
+
 
 APP_TITLE = "Pickup Stat Tracker"
 DB_PATH = Path("data") / "basketball_stats.sqlite3"
+DATABASE_URL_ENV = "DATABASE_URL"
+GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
+GITHUB_REPO_ENV = "GITHUB_REPO"
+GITHUB_DATA_BRANCH_ENV = "GITHUB_DATA_BRANCH"
+GITHUB_DB_PATH_ENV = "GITHUB_DB_PATH"
+DEFAULT_GITHUB_REPO = "llmarsii/bball-stats"
+DEFAULT_GITHUB_DATA_BRANCH = "data"
+DEFAULT_GITHUB_DB_PATH = "basketball_stats.sqlite3"
 DEFAULT_PLAYERS = [
     "Player 1",
     "Player 2",
@@ -101,11 +121,263 @@ st.set_page_config(
 )
 
 
+def configured_value(name: str, default: str = "") -> str:
+    env_value = os.environ.get(name)
+    if env_value:
+        return env_value
+    try:
+        return str(st.secrets.get(name, default) or default)
+    except Exception:
+        return default
+
+
+def configured_database_url() -> str:
+    return configured_value(DATABASE_URL_ENV)
+
+
+DATABASE_URL = configured_database_url()
+
+
+def using_postgres() -> bool:
+    return bool(DATABASE_URL)
+
+
+def github_storage_config() -> dict:
+    return {
+        "token": configured_value(GITHUB_TOKEN_ENV),
+        "repo": configured_value(GITHUB_REPO_ENV, DEFAULT_GITHUB_REPO),
+        "branch": configured_value(GITHUB_DATA_BRANCH_ENV, DEFAULT_GITHUB_DATA_BRANCH),
+        "path": configured_value(GITHUB_DB_PATH_ENV, DEFAULT_GITHUB_DB_PATH),
+    }
+
+
+def using_github_storage() -> bool:
+    config = github_storage_config()
+    return not using_postgres() and bool(config["token"] and config["repo"])
+
+
+def to_postgres_sql(sql: str) -> str:
+    return sql.replace("?", "%s")
+
+
+class PostgresConnection:
+    def __init__(self, database_url: str):
+        if psycopg2 is None or DictCursor is None:
+            raise RuntimeError(
+                "DATABASE_URL is configured, but psycopg2-binary is not installed."
+            )
+        self.conn = psycopg2.connect(database_url)
+
+    def __enter__(self) -> "PostgresConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
+
+    def execute(self, sql: str, params: tuple = ()):
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(to_postgres_sql(sql), params)
+        return cursor
+
+    def executemany(self, sql: str, param_list: list[tuple]) -> None:
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        cursor.executemany(to_postgres_sql(sql), param_list)
+
+
 def db() -> sqlite3.Connection:
+    if using_postgres():
+        return PostgresConnection(DATABASE_URL)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def normalize_row(row) -> dict:
+    data = dict(row)
+    for key, value in data.items():
+        if isinstance(value, memoryview):
+            data[key] = value.tobytes()
+    return data
+
+
+def github_api_request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    allow_missing: bool = False,
+) -> dict | None:
+    config = github_storage_config()
+    url = f"https://api.github.com/repos/{config['repo']}{path}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {config['token']}",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if allow_missing and exc.code == 404:
+            return None
+        raise RuntimeError(f"GitHub API returned HTTP {exc.code} for {path}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach GitHub API: {exc.reason}") from exc
+    return json.loads(body.decode("utf-8")) if body else {}
+
+
+def github_content_sha() -> str | None:
+    config = github_storage_config()
+    encoded_path = "/".join(
+        urllib.parse.quote(part)
+        for part in config["path"].strip("/").split("/")
+    )
+    result = github_api_request(
+        "GET",
+        f"/contents/{encoded_path}?ref={urllib.parse.quote(config['branch'])}",
+        allow_missing=True,
+    )
+    return result.get("sha") if result else None
+
+
+def ensure_github_data_branch() -> None:
+    config = github_storage_config()
+    branch = urllib.parse.quote(config["branch"], safe="")
+    if github_api_request("GET", f"/git/ref/heads/{branch}", allow_missing=True):
+        return
+    source_ref = github_api_request("GET", "/git/ref/heads/main")
+    github_api_request(
+        "POST",
+        "/git/refs",
+        {
+            "ref": f"refs/heads/{config['branch']}",
+            "sha": source_ref["object"]["sha"],
+        },
+    )
+
+
+def download_db_from_github() -> bool:
+    if not using_github_storage():
+        return False
+    config = github_storage_config()
+    encoded_path = "/".join(
+        urllib.parse.quote(part)
+        for part in config["path"].strip("/").split("/")
+    )
+    result = github_api_request(
+        "GET",
+        f"/contents/{encoded_path}?ref={urllib.parse.quote(config['branch'])}",
+        allow_missing=True,
+    )
+    if not result:
+        return False
+    content = result.get("content")
+    if not content and result.get("sha"):
+        blob = github_api_request("GET", f"/git/blobs/{result['sha']}")
+        content = blob.get("content") if blob else None
+    if not content:
+        return False
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DB_PATH.write_bytes(base64.b64decode(content))
+    return True
+
+
+def upload_db_to_github() -> bool:
+    if not using_github_storage() or not DB_PATH.exists():
+        return False
+    config = github_storage_config()
+    ensure_github_data_branch()
+    encoded_path = "/".join(
+        urllib.parse.quote(part)
+        for part in config["path"].strip("/").split("/")
+    )
+    payload = {
+        "message": f"Update basketball stats backup {datetime.utcnow().isoformat()}",
+        "content": base64.b64encode(DB_PATH.read_bytes()).decode("ascii"),
+        "branch": config["branch"],
+    }
+    sha = github_content_sha()
+    if sha:
+        payload["sha"] = sha
+    github_api_request("PUT", f"/contents/{encoded_path}", payload)
+    return True
+
+
+def local_db_has_user_data() -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        game_count = conn.execute("SELECT COUNT(*) FROM game_stats").fetchone()[0]
+        asset_count = conn.execute("SELECT COUNT(*) FROM app_assets").fetchone()[0]
+        photo_count = conn.execute(
+            "SELECT COUNT(*) FROM players WHERE photo_blob IS NOT NULL"
+        ).fetchone()[0]
+        player_names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM players ORDER BY sort_order, id"
+            ).fetchall()
+        ]
+        conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(
+        game_count
+        or asset_count
+        or photo_count
+        or player_names != DEFAULT_PLAYERS
+    )
+
+
+def restore_db_from_github_if_needed() -> None:
+    if using_postgres() or local_db_has_user_data():
+        return
+    try:
+        download_db_from_github()
+    except RuntimeError as exc:
+        st.session_state.github_storage_error = str(exc)
+
+
+def backup_db_to_github_if_configured() -> None:
+    if using_postgres():
+        return
+    try:
+        if upload_db_to_github():
+            st.session_state.github_storage_error = ""
+    except RuntimeError as exc:
+        st.session_state.github_storage_error = str(exc)
+
+
+def table_columns(conn, table_name: str) -> dict:
+    if using_postgres():
+        rows = conn.execute(
+            """
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = ?
+            """,
+            (table_name,),
+        ).fetchall()
+        return {row["name"]: row for row in rows}
+    return {
+        row["name"]: row
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
 
 
 def create_game_stats_table(conn: sqlite3.Connection) -> None:
@@ -135,11 +407,12 @@ def create_game_stats_table(conn: sqlite3.Connection) -> None:
 
 
 def create_app_assets_table(conn: sqlite3.Connection) -> None:
+    blob_type = "BYTEA" if using_postgres() else "BLOB"
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS app_assets (
             asset_key TEXT PRIMARY KEY,
-            image_blob BLOB NOT NULL,
+            image_blob {blob_type} NOT NULL,
             image_mime TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -148,9 +421,7 @@ def create_app_assets_table(conn: sqlite3.Connection) -> None:
 
 
 def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
-    columns = {
-        row["name"]: row for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
-    }
+    columns = table_columns(conn, "game_stats")
     migrations = {
         "field_goals_made": "INTEGER NOT NULL DEFAULT 0",
         "field_goals_attempted": "INTEGER NOT NULL DEFAULT 0",
@@ -160,9 +431,7 @@ def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
         if column not in columns:
             conn.execute(f"ALTER TABLE game_stats ADD COLUMN {column} {definition}")
 
-    columns = {
-        row["name"]: row for row in conn.execute("PRAGMA table_info(game_stats)").fetchall()
-    }
+    columns = table_columns(conn, "game_stats")
     if "game_number" in columns:
         return
 
@@ -201,14 +470,17 @@ def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
+    restore_db_from_github_if_needed()
+    id_type = "SERIAL PRIMARY KEY" if using_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob_type = "BYTEA" if using_postgres() else "BLOB"
     with db() as conn:
         conn.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS players (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_type},
                 name TEXT NOT NULL,
                 sort_order INTEGER NOT NULL,
-                photo_blob BLOB,
+                photo_blob {blob_type},
                 photo_mime TEXT,
                 updated_at TEXT NOT NULL
             )
@@ -239,7 +511,7 @@ def get_players() -> list[dict]:
             ORDER BY sort_order, id
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [normalize_row(row) for row in rows]
 
 
 def update_player_name(player_id: int, name: str) -> None:
@@ -254,6 +526,7 @@ def update_player_name(player_id: int, name: str) -> None:
         )
     get_players.clear()
     all_stats.clear()
+    backup_db_to_github_if_configured()
 
 
 def update_player_photo(player_id: int, image_bytes: bytes, mime_type: str) -> None:
@@ -267,6 +540,7 @@ def update_player_photo(player_id: int, image_bytes: bytes, mime_type: str) -> N
             (image_bytes, mime_type, datetime.utcnow().isoformat(), player_id),
         )
     get_players.clear()
+    backup_db_to_github_if_configured()
 
 
 def remove_player_photo(player_id: int) -> None:
@@ -280,6 +554,7 @@ def remove_player_photo(player_id: int) -> None:
             (datetime.utcnow().isoformat(), player_id),
         )
     get_players.clear()
+    backup_db_to_github_if_configured()
 
 
 @st.cache_data(ttl=2)
@@ -293,7 +568,7 @@ def get_background_asset(asset_key: str) -> dict | None:
             """,
             (asset_key,),
         ).fetchone()
-    return dict(row) if row else None
+    return normalize_row(row) if row else None
 
 
 def update_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> None:
@@ -310,12 +585,14 @@ def update_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) 
             (asset_key, image_bytes, mime_type, datetime.utcnow().isoformat()),
         )
     get_background_asset.clear()
+    backup_db_to_github_if_configured()
 
 
 def remove_background_asset(asset_key: str) -> None:
     with db() as conn:
         conn.execute("DELETE FROM app_assets WHERE asset_key = ?", (asset_key,))
     get_background_asset.clear()
+    backup_db_to_github_if_configured()
 
 
 def background_data_url(asset_key: str) -> str:
@@ -337,7 +614,7 @@ def stats_for_date(game_date: date) -> list[dict]:
             """,
             (game_date.isoformat(),),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [normalize_row(row) for row in rows]
 
 
 def stats_by_game(game_date: date, player_id: int) -> dict[int, dict]:
@@ -408,6 +685,7 @@ def save_stat_line(game_date: date, game_number: int, player_id: int, values: di
                 now,
             ),
         )
+    backup_db_to_github_if_configured()
 
 
 def delete_stat_line(game_date: date, game_number: int, player_id: int) -> None:
@@ -422,12 +700,13 @@ def delete_stat_line(game_date: date, game_number: int, player_id: int) -> None:
             (game_date.isoformat(), game_number, player_id),
         )
     all_stats.clear()
+    backup_db_to_github_if_configured()
 
 
 @st.cache_data(ttl=2)
 def all_stats() -> pd.DataFrame:
     with db() as conn:
-        df = pd.read_sql_query(
+        rows = conn.execute(
             """
             SELECT
                 gs.game_date,
@@ -450,10 +729,9 @@ def all_stats() -> pd.DataFrame:
             FROM game_stats gs
             JOIN players p ON p.id = gs.player_id
             ORDER BY gs.game_date DESC, gs.game_number DESC, p.sort_order, p.id
-            """,
-            conn,
-        )
-    return df
+            """
+        ).fetchall()
+    return pd.DataFrame([normalize_row(row) for row in rows])
 
 
 def stat_input(label: str, key: str, value: int) -> int:
@@ -869,6 +1147,30 @@ def csv_safe_name(name: str) -> str:
     return "_".join(part for part in safe_name.split("_") if part) or "player"
 
 
+def render_storage_warning() -> None:
+    if using_postgres():
+        return
+    if using_github_storage():
+        config = github_storage_config()
+        st.success(
+            f"GitHub backup is active: {config['repo']} / {config['branch']} / {config['path']}."
+        )
+        error = st.session_state.get("github_storage_error")
+        if error:
+            st.error(f"GitHub backup error: {error}")
+        return
+    st.warning(
+        "Temporary local storage is active. Add GitHub backup secrets before using the hosted app for real games.",
+    )
+    if DB_PATH.exists():
+        st.download_button(
+            "Download SQLite Backup",
+            data=DB_PATH.read_bytes(),
+            file_name="basketball_stats.sqlite3",
+            mime="application/octet-stream",
+        )
+
+
 def render_player_page(players: list[dict]) -> None:
     st.subheader("Player Page")
     current_player_id = selected_player_id(players)
@@ -1248,6 +1550,7 @@ def main() -> None:
     players = get_players()
     st.title(APP_TITLE)
     st.caption("Shared box scores for pickup nights.")
+    render_storage_warning()
 
     tab_game, tab_player, tab_summary, tab_leaderboard, tab_backgrounds, tab_roster = st.tabs(
         ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Backgrounds", "Roster"]

@@ -37,8 +37,42 @@ Streamlit Community Cloud currently describes app hosting as free and deploys di
 4. Sign in with GitHub.
 5. Click `Create app`.
 6. Choose the GitHub repo, branch, and `app.py` as the app file.
-7. Deploy the app and share the generated `*.streamlit.app` URL with the group.
+7. Add a persistent database before sharing the app for real stat entry.
+8. Deploy the app and share the generated `*.streamlit.app` URL with the group.
+
+## Simple hosted storage with GitHub
+
+The simplest no-new-account option is to let the app back up its SQLite database to this GitHub repo. The app stores the backup on a separate `data` branch so stat saves do not trigger normal Streamlit redeploys from `main`.
+
+In Streamlit app secrets, add:
+
+```toml
+GITHUB_TOKEN = "YOUR_GITHUB_FINE_GRAINED_TOKEN"
+GITHUB_REPO = "llmarsii/bball-stats"
+GITHUB_DATA_BRANCH = "data"
+GITHUB_DB_PATH = "basketball_stats.sqlite3"
+```
+
+The token needs Contents read/write access for this repository. On startup, the app restores `basketball_stats.sqlite3` from the `data` branch if the local database is empty. After each stat, roster, photo, or background change, it uploads the updated SQLite file back to GitHub.
+
+This is intentionally simple and free. It is good for a small group entering stats one at a time. It is not a high-concurrency database.
+
+## Optional database storage
+
+If you later want a real hosted database, create a small hosted Postgres database with a provider such as Supabase or Neon, then add this secret in the Streamlit app settings:
+
+```toml
+DATABASE_URL = "postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require"
+```
+
+When `DATABASE_URL` is configured, the app uses Postgres directly and does not use GitHub SQLite backup.
 
 ## Data storage note
 
-Stats, profile photos, and background images are stored in a local SQLite database at `data/basketball_stats.sqlite3`. This is intentionally lightweight and fine for a small group, but hosted filesystem persistence can be less durable than a real database. If you want stronger long-term persistence later, the app can be moved to a free hosted backend such as Supabase or Google Sheets.
+Stats, profile photos, and background images are stored in:
+
+- Postgres, when `DATABASE_URL` is configured.
+- Local SQLite at `data/basketball_stats.sqlite3`, backed up to GitHub when `GITHUB_TOKEN` is configured.
+- Local SQLite only, when neither `DATABASE_URL` nor `GITHUB_TOKEN` is configured.
+
+Do not rely on local SQLite alone for production hosted data.
