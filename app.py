@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import sqlite3
@@ -972,17 +973,6 @@ def select_player(player_id: int) -> None:
     st.session_state.active_player_id = player_id
 
 
-def carousel_player_window(players: list[dict], current_index: int) -> list[tuple[int, dict]]:
-    if len(players) <= 3:
-        return list(enumerate(players))
-    indexes = [
-        (current_index - 1) % len(players),
-        current_index,
-        (current_index + 1) % len(players),
-    ]
-    return [(index, players[index]) for index in indexes]
-
-
 def render_player_avatar(player: dict, size: int = 92) -> None:
     if player.get("photo_blob"):
         mime_type = player.get("photo_mime") or "image/png"
@@ -1009,51 +999,50 @@ def render_player_picker(
         (index for index, player in enumerate(players) if player["id"] == current_player_id),
         0,
     )
-    st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
-    carousel_cols = st.columns([0.7, 1, 1, 1, 0.7])
-    with carousel_cols[0]:
-        if st.button("<", key=f"{scope}_prev_player", use_container_width=True):
-            select_player(players[(current_index - 1) % len(players)]["id"])
-            st.rerun()
-
-    visible_players = carousel_player_window(players, current_index)
-    for column, (index, player) in zip(carousel_cols[1:4], visible_players):
-        color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
-        selected = player["id"] == current_player_id
-        badge = player_badges.get(player["id"], "")
-        with column:
-            render_player_avatar(player)
-            st.markdown(
-                f'<div class="carousel-player-name" style="color:{color};">{player["name"]}</div>',
-                unsafe_allow_html=True,
-            )
-            if badge:
-                st.markdown(
-                    f'<div class="carousel-player-badge">{badge}</div>',
-                    unsafe_allow_html=True,
-                )
-            if st.button(
-                "Current" if selected else "Select",
-                key=f"{scope}_player_{player['id']}",
-                use_container_width=True,
-                disabled=selected,
-            ):
-                select_player(player["id"])
+    with st.container(key=f"{scope}_player_picker"):
+        st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
+        columns = st.columns([0.56, *([1] * len(players)), 0.56])
+        with columns[0]:
+            if st.button("<", key=f"{scope}_prev_player", use_container_width=True):
+                select_player(players[(current_index - 1) % len(players)]["id"])
                 st.rerun()
 
-    with carousel_cols[4]:
-        if st.button(">", key=f"{scope}_next_player", use_container_width=True):
-            select_player(players[(current_index + 1) % len(players)]["id"])
-            st.rerun()
+        for index, player in enumerate(players):
+            color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
+            selected = player["id"] == current_player_id
+            badge = player_badges.get(player["id"], "")
+            with columns[index + 1]:
+                render_player_avatar(player)
+                st.markdown(
+                    (
+                        f'<div class="carousel-player-name" style="color:{color};">'
+                        f'{html.escape(player["name"])}</div>'
+                    ),
+                    unsafe_allow_html=True,
+                )
+                if badge:
+                    st.markdown(
+                        f'<div class="carousel-player-badge">{html.escape(badge)}</div>',
+                        unsafe_allow_html=True,
+                    )
+                if st.button(
+                    "Current" if selected else "Select",
+                    key=f"{scope}_player_{player['id']}",
+                    use_container_width=True,
+                    disabled=selected,
+                ):
+                    select_player(player["id"])
+                    st.rerun()
+
+        with columns[-1]:
+            if st.button(">", key=f"{scope}_next_player", use_container_width=True):
+                select_player(players[(current_index + 1) % len(players)]["id"])
+                st.rerun()
 
 
 def render_player_header(player: dict) -> None:
-    header_cols = st.columns([1, 4])
-    with header_cols[0]:
-        render_photo(player, size=112)
-    with header_cols[1]:
-        st.markdown(f"### {player['name']}")
-        st.caption("Night-by-night stat history. Click any column header to sort.")
+    st.markdown(f"### {player['name']}")
+    st.caption("Night-by-night stat history. Click any column header to sort.")
 
 
 def render_player_stats_detail(player: dict) -> None:
@@ -1163,18 +1152,6 @@ def render_photo(player: dict, size: int = 96) -> None:
     st.markdown(
         f'<div class="photo-placeholder" style="width:{size}px;height:{size}px;">+</div>',
         unsafe_allow_html=True,
-    )
-
-
-def render_photo_upload_control(player: dict, key: str, size: int = 112) -> object | None:
-    if player.get("photo_blob"):
-        render_photo(player, size=size)
-        st.caption("Tap + to replace")
-    return st.file_uploader(
-        "+ profile photo",
-        type=["png", "jpg", "jpeg", "webp"],
-        key=key,
-        label_visibility="collapsed",
     )
 
 
@@ -1301,27 +1278,15 @@ def render_game_night(players: list[dict]) -> None:
         st.session_state[game_key] = next_game
 
     with st.container(border=True):
-        top_cols = st.columns([1, 4])
-        with top_cols[0]:
-            uploaded = render_photo_upload_control(
-                current_player,
-                key=f"photo_{current_player['id']}",
-                size=112,
-            )
-            if uploaded is not None:
-                update_player_photo(current_player["id"], uploaded.getvalue(), uploaded.type)
-                st.success("Photo saved.")
-                st.rerun()
-        with top_cols[1]:
-            st.markdown(f"### {current_player['name']}")
-            selected_game = st.selectbox(
-                "Game",
-                options=game_options,
-                key=game_key,
-                format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
-            )
-            current_stats = player_games.get(selected_game, {})
-            edit_key = f"editing_{game_date}_{selected_game}_{current_player_id}"
+        st.markdown(f"### {current_player['name']}")
+        selected_game = st.selectbox(
+            "Game",
+            options=game_options,
+            key=game_key,
+            format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
+        )
+        current_stats = player_games.get(selected_game, {})
+        edit_key = f"editing_{game_date}_{selected_game}_{current_player_id}"
 
         if current_stats and not st.session_state.get(edit_key, False):
             render_saved_stat_line(current_player, game_date, selected_game, current_stats)
@@ -1544,15 +1509,7 @@ def render_roster(players: list[dict]) -> None:
         with st.container(border=True):
             cols = st.columns([1, 4, 2])
             with cols[0]:
-                uploaded = render_photo_upload_control(
-                    player,
-                    key=f"roster_photo_{player['id']}",
-                    size=84,
-                )
-                if uploaded is not None:
-                    update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
-                    st.success("Photo saved.")
-                    st.rerun()
+                render_photo(player, size=84)
             with cols[1]:
                 new_name = st.text_input(
                     "Player name",
@@ -1564,6 +1521,16 @@ def render_roster(players: list[dict]) -> None:
                     st.success("Name saved.")
                     st.rerun()
             with cols[2]:
+                with st.container(key=f"roster_photo_controls_{player['id']}"):
+                    uploaded = st.file_uploader(
+                        "Replace photo" if player.get("photo_blob") else "Add photo",
+                        type=["png", "jpg", "jpeg", "webp"],
+                        key=f"roster_photo_{player['id']}",
+                    )
+                    if uploaded is not None:
+                        update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+                        st.success("Photo saved.")
+                        st.rerun()
                 if player.get("photo_blob") and st.button("Remove photo", key=f"remove_photo_{player['id']}"):
                     remove_player_photo(player["id"])
                     st.success("Photo removed.")
@@ -1629,7 +1596,10 @@ def inject_css(background_url: str = "") -> None:
             font-weight: 900;
         }}
         div[data-baseweb="input"] input,
+        div[data-baseweb="base-input"],
         div[data-baseweb="select"] > div,
+        div[data-baseweb="select"] div,
+        div[data-baseweb="textarea"],
         textarea {{
             background: {widget_bg} !important;
             border-color: {widget_border} !important;
@@ -1640,6 +1610,17 @@ def inject_css(background_url: str = "") -> None:
         div[data-baseweb="input"] svg {{
             color: {widget_text} !important;
             fill: {widget_text} !important;
+        }}
+        div[data-baseweb="popover"],
+        div[data-baseweb="popover"] ul,
+        div[role="listbox"],
+        div[role="option"] {{
+            background: {widget_bg} !important;
+            color: {widget_text} !important;
+        }}
+        div[role="option"] div,
+        div[role="option"] span {{
+            color: {widget_text} !important;
         }}
         div[role="radiogroup"] label,
         div[role="radiogroup"] p,
@@ -1695,6 +1676,35 @@ def inject_css(background_url: str = "") -> None:
         .photo-placeholder {{
             border-radius: 8px;
         }}
+        .st-key-game_night_player_picker,
+        .st-key-player_page_player_picker {{
+            margin: 0.5rem 0 1rem;
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding-bottom: 0.35rem;
+            scrollbar-width: thin;
+        }}
+        .st-key-game_night_player_picker div[data-testid="stHorizontalBlock"],
+        .st-key-player_page_player_picker div[data-testid="stHorizontalBlock"] {{
+            align-items: start;
+            flex-wrap: nowrap !important;
+            gap: 0.65rem;
+            min-width: max-content;
+        }}
+        .st-key-game_night_player_picker div[data-testid="stColumn"],
+        .st-key-player_page_player_picker div[data-testid="stColumn"] {{
+            flex: 0 0 6.9rem !important;
+            min-width: 6.9rem !important;
+            width: 6.9rem !important;
+        }}
+        .st-key-game_night_player_picker div[data-testid="stColumn"]:first-child,
+        .st-key-game_night_player_picker div[data-testid="stColumn"]:last-child,
+        .st-key-player_page_player_picker div[data-testid="stColumn"]:first-child,
+        .st-key-player_page_player_picker div[data-testid="stColumn"]:last-child {{
+            flex-basis: 3.4rem !important;
+            min-width: 3.4rem !important;
+            width: 3.4rem !important;
+        }}
         div[data-testid="stButton"] button {{
             background: {widget_bg} !important;
             border: 1px solid {widget_border} !important;
@@ -1705,6 +1715,11 @@ def inject_css(background_url: str = "") -> None:
         }}
         div[data-testid="stButton"] button p {{
             color: {widget_text} !important;
+        }}
+        div[data-testid="stButton"] button *,
+        div[data-testid="stDownloadButton"] button *,
+        div[data-testid="stFormSubmitButton"] button * {{
+            color: inherit !important;
         }}
         div[data-testid="stButton"] button:disabled {{
             background: {disabled_bg} !important;
@@ -1720,6 +1735,27 @@ def inject_css(background_url: str = "") -> None:
             font-size: 1.05rem;
             font-weight: 800;
             min-height: 3rem;
+        }}
+        div[data-testid="stDownloadButton"] button,
+        div[data-testid="stNumberInput"] button,
+        div[data-testid="stFormSubmitButton"] button {{
+            background: {widget_bg} !important;
+            border-color: {widget_border} !important;
+            color: {widget_text} !important;
+        }}
+        div[data-testid="stNumberInput"] input {{
+            background: {widget_bg} !important;
+            color: {widget_text} !important;
+        }}
+        div[data-testid="stExpander"] details {{
+            background: {panel} !important;
+            border: 1px solid {panel_border} !important;
+            border-radius: 8px !important;
+            color: {text} !important;
+        }}
+        div[data-testid="stExpander"] summary,
+        div[data-testid="stExpander"] summary * {{
+            color: {text} !important;
         }}
         div[data-testid="stMetric"] {{
             background: {panel};
@@ -1772,14 +1808,43 @@ def inject_css(background_url: str = "") -> None:
             position: absolute;
             width: 112px;
         }}
+        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] {{
+            width: 100%;
+        }}
+        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            display: block;
+            height: auto;
+            min-height: 0;
+            padding: 0;
+            width: 100%;
+        }}
+        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {{
+            content: none;
+        }}
+        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {{
+            display: none;
+        }}
+        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+            background: {widget_bg} !important;
+            border: 1px solid {widget_border} !important;
+            border-radius: 8px;
+            color: {widget_text} !important;
+            cursor: pointer;
+            font-weight: 800;
+            height: auto;
+            opacity: 1;
+            padding: 0.45rem 0.65rem;
+            position: static;
+            width: 100%;
+        }}
         @media (max-width: 760px) {{
             .block-container {{
                 padding-left: 0.8rem;
                 padding-right: 0.8rem;
                 padding-top: 0.8rem;
-            }}
-            div[data-testid="stHorizontalBlock"] {{
-                gap: 0.35rem;
             }}
             .player-strip-label {{
                 font-size: 0.72rem;
@@ -1787,6 +1852,32 @@ def inject_css(background_url: str = "") -> None:
             }}
             .carousel-player-name {{
                 font-size: 0.78rem;
+            }}
+            .carousel-player-badge {{
+                font-size: 0.68rem;
+            }}
+            .st-key-game_night_player_picker,
+            .st-key-player_page_player_picker {{
+                margin-left: -0.1rem;
+                margin-right: -0.1rem;
+            }}
+            .st-key-game_night_player_picker div[data-testid="stHorizontalBlock"],
+            .st-key-player_page_player_picker div[data-testid="stHorizontalBlock"] {{
+                gap: 0.5rem;
+            }}
+            .st-key-game_night_player_picker div[data-testid="stColumn"],
+            .st-key-player_page_player_picker div[data-testid="stColumn"] {{
+                flex-basis: 5.9rem !important;
+                min-width: 5.9rem !important;
+                width: 5.9rem !important;
+            }}
+            .st-key-game_night_player_picker div[data-testid="stColumn"]:first-child,
+            .st-key-game_night_player_picker div[data-testid="stColumn"]:last-child,
+            .st-key-player_page_player_picker div[data-testid="stColumn"]:first-child,
+            .st-key-player_page_player_picker div[data-testid="stColumn"]:last-child {{
+                flex-basis: 2.8rem !important;
+                min-width: 2.8rem !important;
+                width: 2.8rem !important;
             }}
             div[data-testid="stButton"] button {{
                 font-size: 0.72rem;
