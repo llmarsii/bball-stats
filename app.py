@@ -1723,15 +1723,19 @@ def inject_css(background_url: str = "") -> None:
             min-width: 3.4rem !important;
             width: 3.4rem !important;
         }}
+        [class*="st-key-game_night_player_tile_"],
         [class*="st-key-player_page_player_tile_"] {{
             cursor: pointer;
             min-height: 7.4rem;
             position: relative;
         }}
+        [class*="st-key-game_night_player_tile_"] .carousel-avatar,
+        [class*="st-key-game_night_player_tile_"] .carousel-avatar-placeholder,
         [class*="st-key-player_page_player_tile_"] .carousel-avatar,
         [class*="st-key-player_page_player_tile_"] .carousel-avatar-placeholder {{
             cursor: pointer;
         }}
+        [class*="st-key-game_night_player_"][data-testid="stElementContainer"],
         [class*="st-key-player_page_player_"][data-testid="stElementContainer"] {{
             height: 0;
             left: 50%;
@@ -1742,6 +1746,7 @@ def inject_css(background_url: str = "") -> None:
             width: 92px;
             z-index: 5;
         }}
+        [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button {{
             background: transparent !important;
             border: 0 !important;
@@ -1755,6 +1760,7 @@ def inject_css(background_url: str = "") -> None:
             padding: 0;
             width: 92px;
         }}
+        [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button *,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button * {{
             color: transparent !important;
         }}
@@ -1783,6 +1789,7 @@ def inject_css(background_url: str = "") -> None:
         div[data-testid="stButton"] button:disabled p {{
             color: {disabled_text} !important;
         }}
+        [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button:disabled,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button:disabled {{
             background: transparent !important;
             border: 0 !important;
@@ -1790,6 +1797,7 @@ def inject_css(background_url: str = "") -> None:
             cursor: default;
             opacity: 0 !important;
         }}
+        [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button:disabled *,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button:disabled * {{
             color: transparent !important;
         }}
