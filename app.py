@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -33,6 +34,11 @@ GITHUB_DB_PATH_ENV = "GITHUB_DB_PATH"
 DEFAULT_GITHUB_REPO = "llmarsii/bball-stats"
 DEFAULT_GITHUB_DATA_BRANCH = "data"
 DEFAULT_GITHUB_DB_PATH = "basketball_stats.sqlite3"
+APP_TIME_ZONE_NAME = os.getenv("APP_TIME_ZONE", "America/Los_Angeles")
+try:
+    APP_TIME_ZONE = ZoneInfo(APP_TIME_ZONE_NAME)
+except ZoneInfoNotFoundError:
+    APP_TIME_ZONE = None
 DEFAULT_PLAYERS = [
     "Player 1",
     "Player 2",
@@ -924,9 +930,15 @@ def format_game_date(game_date: date) -> str:
     return f"{game_date:%b} {game_date.day}, {game_date:%Y}"
 
 
+def app_today() -> date:
+    if APP_TIME_ZONE is None:
+        return date.today()
+    return datetime.now(APP_TIME_ZONE).date()
+
+
 def active_background_date() -> date:
     value = st.session_state.get("playing_date") or st.session_state.get("summary_date")
-    return value if isinstance(value, date) else date.today()
+    return value if isinstance(value, date) else app_today()
 
 
 def night_background_key(game_date: date) -> str:
@@ -1261,7 +1273,7 @@ def render_saved_stat_line(player: dict, game_date: date, game_number: int, stat
 
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
-    game_date = st.date_input("Playing date", value=date.today(), key="playing_date")
+    game_date = st.date_input("Playing date", value=app_today(), key="playing_date")
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
     st.caption("Select a player, then enter one game at a time. The next game opens automatically after saving.")
@@ -1297,7 +1309,7 @@ def render_game_night(players: list[dict]) -> None:
 
 def render_nightly_summary() -> None:
     st.subheader("Nightly Summary")
-    game_date = st.date_input("Summary date", value=date.today(), key="summary_date")
+    game_date = st.date_input("Summary date", value=app_today(), key="summary_date")
     summary = nightly_summary(game_date)
     game_log = nightly_game_log(game_date)
 
@@ -1352,10 +1364,6 @@ def render_storage_warning() -> None:
     if using_postgres():
         return
     if using_github_storage():
-        config = github_storage_config()
-        st.success(
-            f"GitHub backup is active: {config['repo']} / {config['branch']} / {config['path']}."
-        )
         error = st.session_state.get("github_storage_error")
         if error:
             st.error(f"GitHub backup error: {error}")
@@ -1601,6 +1609,17 @@ def inject_css(background_url: str = "") -> None:
             padding-top: 1.2rem;
             padding-bottom: 2.5rem;
             max-width: 1120px;
+        }}
+        #MainMenu,
+        footer,
+        header[data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        .stDeployButton {{
+            display: none !important;
+            height: 0 !important;
+            visibility: hidden !important;
         }}
         .stApp, .stMarkdown, p, label, h1, h2, h3 {{
             color: {text} !important;
