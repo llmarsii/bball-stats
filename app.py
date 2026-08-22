@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import html
+import hashlib
 import json
 import os
 import sqlite3
@@ -322,7 +322,22 @@ def local_db_has_user_data() -> bool:
     try:
         conn = sqlite3.connect(DB_PATH)
         game_count = conn.execute("SELECT COUNT(*) FROM game_stats").fetchone()[0]
-        asset_count = conn.execute("SELECT COUNT(*) FROM app_assets").fetchone()[0]
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        asset_count = (
+            conn.execute("SELECT COUNT(*) FROM app_assets").fetchone()[0]
+            if "app_assets" in table_names
+            else 0
+        )
+        background_count = (
+            conn.execute("SELECT COUNT(*) FROM background_images").fetchone()[0]
+            if "background_images" in table_names
+            else 0
+        )
         photo_count = conn.execute(
             "SELECT COUNT(*) FROM players WHERE photo_blob IS NOT NULL"
         ).fetchone()[0]
@@ -338,6 +353,7 @@ def local_db_has_user_data() -> bool:
     return bool(
         game_count
         or asset_count
+        or background_count
         or photo_count
         or player_names != DEFAULT_PLAYERS
     )
@@ -420,6 +436,65 @@ def create_app_assets_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def create_background_images_table(conn: sqlite3.Connection) -> None:
+    id_type = "SERIAL PRIMARY KEY" if using_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob_type = "BYTEA" if using_postgres() else "BLOB"
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS background_images (
+            id {id_type},
+            asset_key TEXT NOT NULL,
+            image_blob {blob_type} NOT NULL,
+            image_mime TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS background_picks (
+            game_date TEXT NOT NULL,
+            asset_key TEXT NOT NULL,
+            background_image_id INTEGER NOT NULL,
+            selected_at TEXT NOT NULL,
+            PRIMARY KEY (game_date, asset_key)
+        )
+        """
+    )
+
+
+def migrate_legacy_background_assets(conn) -> None:
+    for asset_key in BACKGROUND_KEYS:
+        existing_count = conn.execute(
+            "SELECT COUNT(*) FROM background_images WHERE asset_key = ?",
+            (asset_key,),
+        ).fetchone()[0]
+        if existing_count:
+            continue
+        row = conn.execute(
+            """
+            SELECT image_blob, image_mime, updated_at
+            FROM app_assets
+            WHERE asset_key = ?
+            """,
+            (asset_key,),
+        ).fetchone()
+        if not row:
+            continue
+        conn.execute(
+            """
+            INSERT INTO background_images (asset_key, image_blob, image_mime, uploaded_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                asset_key,
+                row["image_blob"],
+                row["image_mime"],
+                row["updated_at"],
+            ),
+        )
+
+
 def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
     columns = table_columns(conn, "game_stats")
     migrations = {
@@ -488,6 +563,8 @@ def init_db() -> None:
         )
         create_game_stats_table(conn)
         create_app_assets_table(conn)
+        create_background_images_table(conn)
+        migrate_legacy_background_assets(conn)
         ensure_game_stats_schema(conn)
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
@@ -558,49 +635,96 @@ def remove_player_photo(player_id: int) -> None:
 
 
 @st.cache_data(ttl=2)
-def get_background_asset(asset_key: str) -> dict | None:
+def get_background_assets(asset_key: str) -> list[dict]:
     with db() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             """
-            SELECT image_blob, image_mime
-            FROM app_assets
+            SELECT id, asset_key, image_blob, image_mime, uploaded_at
+            FROM background_images
             WHERE asset_key = ?
+            ORDER BY uploaded_at, id
             """,
             (asset_key,),
-        ).fetchone()
-    return normalize_row(row) if row else None
+        ).fetchall()
+    return [normalize_row(row) for row in rows]
 
 
-def update_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> None:
+def add_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> None:
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO app_assets (asset_key, image_blob, image_mime, updated_at)
+            INSERT INTO background_images (asset_key, image_blob, image_mime, uploaded_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(asset_key) DO UPDATE SET
-                image_blob = excluded.image_blob,
-                image_mime = excluded.image_mime,
-                updated_at = excluded.updated_at
             """,
             (asset_key, image_bytes, mime_type, datetime.utcnow().isoformat()),
         )
-    get_background_asset.clear()
+    get_background_assets.clear()
     backup_db_to_github_if_configured()
 
 
-def remove_background_asset(asset_key: str) -> None:
+def remove_background_asset(image_id: int) -> None:
     with db() as conn:
-        conn.execute("DELETE FROM app_assets WHERE asset_key = ?", (asset_key,))
-    get_background_asset.clear()
+        conn.execute("DELETE FROM background_picks WHERE background_image_id = ?", (image_id,))
+        conn.execute("DELETE FROM background_images WHERE id = ?", (image_id,))
+    get_background_assets.clear()
     backup_db_to_github_if_configured()
 
 
-def background_data_url(asset_key: str) -> str:
-    asset = get_background_asset(asset_key) or get_background_asset("neutral")
-    if not asset:
-        return ""
+def asset_to_data_url(asset: dict) -> str:
     encoded = base64.b64encode(asset["image_blob"]).decode("ascii")
     return f"data:{asset['image_mime']};base64,{encoded}"
+
+
+def deterministic_background_choice(assets: list[dict], asset_key: str, game_date: date) -> dict:
+    digest = hashlib.sha256(f"{game_date.isoformat()}:{asset_key}".encode("utf-8")).hexdigest()
+    return assets[int(digest, 16) % len(assets)]
+
+
+def selected_background_asset(asset_key: str, game_date: date) -> dict | None:
+    assets = get_background_assets(asset_key)
+    if not assets and asset_key != "neutral":
+        assets = get_background_assets("neutral")
+        asset_key = "neutral"
+    if not assets:
+        return None
+
+    assets_by_id = {asset["id"]: asset for asset in assets}
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT background_image_id
+            FROM background_picks
+            WHERE game_date = ?
+              AND asset_key = ?
+            """,
+            (game_date.isoformat(), asset_key),
+        ).fetchone()
+        if row and row["background_image_id"] in assets_by_id:
+            return assets_by_id[row["background_image_id"]]
+
+        chosen = deterministic_background_choice(assets, asset_key, game_date)
+        conn.execute(
+            """
+            INSERT INTO background_picks (game_date, asset_key, background_image_id, selected_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(game_date, asset_key) DO UPDATE SET
+                background_image_id = excluded.background_image_id,
+                selected_at = excluded.selected_at
+            """,
+            (
+                game_date.isoformat(),
+                asset_key,
+                chosen["id"],
+                datetime.utcnow().isoformat(),
+            ),
+        )
+    backup_db_to_github_if_configured()
+    return chosen
+
+
+def background_data_url(asset_key: str, game_date: date) -> str:
+    asset = selected_background_asset(asset_key, game_date)
+    return asset_to_data_url(asset) if asset else ""
 
 
 def stats_for_date(game_date: date) -> list[dict]:
@@ -770,17 +894,23 @@ def night_background_key(game_date: date) -> str:
     return "neutral"
 
 
+def theme_mode() -> str:
+    return st.session_state.get("theme_mode", "Dark")
+
+
+def is_dark_mode() -> bool:
+    return bool(st.session_state.get("night_mode_toggle", theme_mode() == "Dark"))
+
+
+def render_theme_toggle() -> None:
+    if "night_mode_toggle" not in st.session_state:
+        st.session_state.night_mode_toggle = is_dark_mode()
+    dark_mode = st.toggle("Night mode", key="night_mode_toggle")
+    st.session_state.theme_mode = "Dark" if dark_mode else "Light"
+
+
 def selected_player_id(players: list[dict]) -> int:
     player_ids = {player["id"] for player in players}
-    try:
-        requested_id = int(st.query_params.get("player_id"))
-    except (TypeError, ValueError):
-        requested_id = None
-
-    if requested_id in player_ids:
-        st.session_state.active_player_id = requested_id
-        return requested_id
-
     active_player_id = st.session_state.get("active_player_id")
     if active_player_id in player_ids:
         return active_player_id
@@ -790,12 +920,8 @@ def selected_player_id(players: list[dict]) -> int:
     return selected_id
 
 
-def photo_src(player: dict) -> str:
-    if not player.get("photo_blob"):
-        return ""
-    mime_type = player.get("photo_mime") or "image/png"
-    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+def select_player(player_id: int) -> None:
+    st.session_state.active_player_id = player_id
 
 
 def render_player_picker(
@@ -803,50 +929,106 @@ def render_player_picker(
     current_player_id: int,
     player_badges: dict[int, str],
     scope: str,
-    lock_on_pick: bool = False,
 ) -> None:
     current_index = next(
         (index for index, player in enumerate(players) if player["id"] == current_player_id),
         0,
     )
-    player_by_id = {player["id"]: player for player in players}
-    picker_key = f"{scope}_player_select_{current_player_id}"
-    selected_id = st.selectbox(
-        "Player",
-        options=[player["id"] for player in players],
-        index=current_index,
-        key=picker_key,
-        format_func=lambda player_id: player_by_id[player_id]["name"],
-    )
-    if selected_id != current_player_id:
-        st.session_state.active_player_id = selected_id
-        if lock_on_pick:
-            st.session_state[f"{scope}_player_locked"] = True
-        st.query_params["player_id"] = str(selected_id)
-        st.rerun()
+    nav_cols = st.columns([1, 8, 1])
+    with nav_cols[0]:
+        if st.button("<", key=f"{scope}_prev_player", use_container_width=True):
+            select_player(players[(current_index - 1) % len(players)]["id"])
+            st.rerun()
+    with nav_cols[1]:
+        st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
+    with nav_cols[2]:
+        if st.button(">", key=f"{scope}_next_player", use_container_width=True):
+            select_player(players[(current_index + 1) % len(players)]["id"])
+            st.rerun()
 
-    cards = []
+    cols = st.columns(len(players))
     for index, player in enumerate(players):
         color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
-        selected_class = " selected" if player["id"] == current_player_id else ""
-        safe_name = html.escape(player["name"])
+        selected = player["id"] == current_player_id
         badge = player_badges.get(player["id"], "")
-        safe_badge = f"<span>{html.escape(badge)}</span>" if badge else ""
-        src = photo_src(player)
-        photo = (
-            f'<img src="{src}" alt="{safe_name}">'
-            if src
-            else '<div class="player-tile-placeholder">+</div>'
-        )
-        entry_param = "&entry=1" if lock_on_pick else ""
-        cards.append(
-            f'<a class="player-tile{selected_class}" href="?player_id={player["id"]}{entry_param}" target="_self">'
-            f'<div class="player-tile-photo">{photo}</div>'
-            f'<div class="player-tile-name" style="color:{color};">{safe_name}{safe_badge}</div>'
-            '</a>'
-        )
+        with cols[index]:
+            st.markdown(
+                f'<div class="player-chip{" selected" if selected else ""}">',
+                unsafe_allow_html=True,
+            )
+            if player.get("photo_blob"):
+                st.image(player["photo_blob"], use_container_width=True)
+            else:
+                st.markdown(
+                    '<div class="player-chip-placeholder">+</div>',
+                    unsafe_allow_html=True,
+                )
+            if st.button(
+                player["name"],
+                key=f"{scope}_player_{player['id']}",
+                use_container_width=True,
+                disabled=selected,
+            ):
+                select_player(player["id"])
+                st.rerun()
+            if badge:
+                st.caption(badge)
+            st.markdown(
+                f'<div class="player-chip-accent" style="background:{color};"></div></div>',
+                unsafe_allow_html=True,
+            )
 
-    st.markdown(f'<div class="player-tile-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+def render_player_header(player: dict) -> None:
+    header_cols = st.columns([1, 4])
+    with header_cols[0]:
+        render_photo(player, size=112)
+    with header_cols[1]:
+        st.markdown(f"### {player['name']}")
+        st.caption("Night-by-night stat history. Click any column header to sort.")
+
+
+def render_player_stats_detail(player: dict) -> None:
+    render_player_header(player)
+
+    history = player_history(player["id"])
+    if history.empty:
+        st.info(f"No stat lines saved for {player['name']} yet.")
+        return
+
+    metric_cols = st.columns(4)
+    total_games = int(history["games"].sum())
+    metric_cols[0].metric("Games", total_games)
+    metric_cols[1].metric("Wins", int(history["wins"].sum()))
+    metric_cols[2].metric("PPG", round(history["points"].sum() / total_games, 1))
+    metric_cols[3].metric("RPG", round(history["rebounds"].sum() / total_games, 1))
+
+    display_columns = list(PLAYER_NIGHT_COLUMNS.keys())
+    display_columns.remove("name")
+    display = history[display_columns].rename(
+        columns={
+            **PLAYER_NIGHT_COLUMNS,
+        }
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Player CSV",
+        data=display.to_csv(index=False),
+        file_name=f"{csv_safe_name(player['name'])}_stats.csv",
+        mime="text/csv",
+    )
+
+    with st.expander("Game-by-game log", expanded=True):
+        games = player_game_log(player["id"])
+        game_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
+        game_columns.remove("name")
+        game_display = games[game_columns].rename(
+            columns={
+                "game_date": "Date",
+                **GAME_LOG_COLUMNS,
+            }
+        )
+        st.dataframe(game_display, use_container_width=True, hide_index=True)
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -1036,8 +1218,9 @@ def render_game_night(players: list[dict]) -> None:
     game_date = st.date_input("Playing date", value=date.today(), key="playing_date")
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
-    if st.query_params.get("entry") == "1":
-        st.session_state.game_night_player_locked = True
+    st.caption("Select a player, then enter one game at a time. The next game opens automatically after saving.")
+    render_player_picker(players, current_player_id, player_badges, scope="game_night")
+
     current_player = next(player for player in players if player["id"] == current_player_id)
     player_games = stats_by_game(game_date, current_player_id)
     next_game = max(player_games.keys(), default=0) + 1
@@ -1048,22 +1231,6 @@ def render_game_night(players: list[dict]) -> None:
         st.session_state[game_key] = st.session_state.pop(pending_game_key)
     if st.session_state.get(game_key) not in game_options:
         st.session_state[game_key] = next_game
-
-    if not st.session_state.get("game_night_player_locked", False):
-        st.caption("Tap your photo or name, then enter one game at a time. The next game opens automatically after saving.")
-        render_player_picker(
-            players,
-            current_player_id,
-            player_badges,
-            scope="game_night",
-            lock_on_pick=True,
-        )
-        return
-
-    if st.button("Change Player", key="game_night_change_player"):
-        st.session_state.game_night_player_locked = False
-        st.query_params.clear()
-        st.rerun()
 
     with st.container(border=True):
         top_cols = st.columns([1, 4])
@@ -1176,80 +1343,55 @@ def render_player_page(players: list[dict]) -> None:
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
     render_player_picker(players, current_player_id, {}, scope="player_page")
-
-    header_cols = st.columns([1, 4])
-    with header_cols[0]:
-        render_photo(current_player, size=112)
-    with header_cols[1]:
-        st.markdown(f"### {current_player['name']}")
-        st.caption("Night-by-night stat history. Click any column header to sort.")
-
-    history = player_history(current_player_id)
-    if history.empty:
-        st.info(f"No stat lines saved for {current_player['name']} yet.")
-        return
-
-    metric_cols = st.columns(4)
-    total_games = int(history["games"].sum())
-    metric_cols[0].metric("Games", total_games)
-    metric_cols[1].metric("Wins", int(history["wins"].sum()))
-    metric_cols[2].metric("PPG", round(history["points"].sum() / total_games, 1))
-    metric_cols[3].metric("RPG", round(history["rebounds"].sum() / total_games, 1))
-
-    display_columns = list(PLAYER_NIGHT_COLUMNS.keys())
-    display_columns.remove("name")
-    display = history[display_columns].rename(
-        columns={
-            **PLAYER_NIGHT_COLUMNS,
-        }
-    )
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    st.download_button(
-        "Download Player CSV",
-        data=display.to_csv(index=False),
-        file_name=f"{csv_safe_name(current_player['name'])}_stats.csv",
-        mime="text/csv",
-    )
-
-    with st.expander("Game-by-game log"):
-        games = player_game_log(current_player_id)
-        game_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
-        game_columns.remove("name")
-        game_display = games[game_columns].rename(
-            columns={
-                "game_date": "Date",
-                **GAME_LOG_COLUMNS,
-            }
-        )
-        st.dataframe(game_display, use_container_width=True, hide_index=True)
+    render_player_stats_detail(current_player)
 
 
 def render_backgrounds() -> None:
     st.subheader("Backgrounds")
-    st.caption("Upload one neutral image, one winning-night image, and one losing-night image.")
+    st.caption("Upload shared background images. The app picks one consistent image for the selected date and current night outcome.")
     current_date = active_background_date()
     current_key = night_background_key(current_date)
-    st.info(f"Current background for {format_game_date(current_date)}: {BACKGROUND_KEYS[current_key]}")
+    current_asset = selected_background_asset(current_key, current_date)
+    st.info(f"Current outcome for {format_game_date(current_date)}: {BACKGROUND_KEYS[current_key]}")
+    if current_asset:
+        st.image(current_asset["image_blob"], caption="Current selected background", use_container_width=True)
 
     for asset_key, label in BACKGROUND_KEYS.items():
         with st.container(border=True):
             st.markdown(f"### {label}")
-            asset = get_background_asset(asset_key)
-            if asset:
-                st.image(asset["image_blob"], use_container_width=True)
+            assets = get_background_assets(asset_key)
+            st.caption(f"{len(assets)} image" if len(assets) == 1 else f"{len(assets)} images")
             uploaded = st.file_uploader(
-                f"Upload {label.lower()}",
+                f"Add {label.lower()}",
                 type=["png", "jpg", "jpeg", "webp"],
                 key=f"background_{asset_key}",
             )
             if uploaded is not None:
-                update_background_asset(asset_key, uploaded.getvalue(), uploaded.type)
-                st.success(f"Saved {label}.")
+                add_background_asset(asset_key, uploaded.getvalue(), uploaded.type)
+                st.success(f"Added {label}.")
                 st.rerun()
-            if asset and st.button(f"Remove {label}", key=f"remove_background_{asset_key}"):
-                remove_background_asset(asset_key)
-                st.success(f"Removed {label}.")
-                st.rerun()
+
+            if not assets:
+                st.info(f"No {label.lower()} images uploaded yet.")
+                continue
+
+            with st.expander(f"Manage {label.lower()} library"):
+                for index, asset in enumerate(assets, start=1):
+                    cols = st.columns([2, 4, 2])
+                    with cols[0]:
+                        st.image(asset["image_blob"], use_container_width=True)
+                    with cols[1]:
+                        st.write(f"Image {index}")
+                        st.caption(f"Uploaded {asset['uploaded_at']}")
+                    with cols[2]:
+                        if st.button(
+                            "Remove",
+                            key=f"remove_background_{asset_key}_{asset['id']}",
+                            use_container_width=True,
+                        ):
+                            remove_background_asset(asset["id"])
+                            st.success(f"Removed {label} image {index}.")
+                            st.rerun()
 
 
 def render_leaderboard() -> None:
@@ -1349,45 +1491,135 @@ def render_roster(players: list[dict]) -> None:
 
 
 def inject_css(background_url: str = "") -> None:
-    background_css = ""
+    dark = is_dark_mode()
+    text = "#f9fafb" if dark else "#111827"
+    muted = "#d4d4d4" if dark else "#4b5563"
+    page_bg = "#101418" if dark else "#f8fafc"
+    panel = "rgba(255, 255, 255, 0.06)" if dark else "rgba(255, 255, 255, 0.84)"
+    panel_border = "rgba(255, 255, 255, 0.16)" if dark else "rgba(17, 24, 39, 0.14)"
+    selected_border = "#ffffff" if dark else "#111827"
+    placeholder_bg = "#f3f4f6" if dark else "#e5e7eb"
+    placeholder_text = "#737373" if dark else "#4b5563"
+    overlay = (
+        "linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9))"
+        if dark
+        else "linear-gradient(rgba(248, 250, 252, 0.84), rgba(248, 250, 252, 0.92))"
+    )
+    background_css = f"""
+        .stApp {{
+            background: {page_bg};
+            color: {text};
+        }}
+    """
     if background_url:
         background_css = f"""
         .stApp {{
             background-image:
-                linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9)),
+                {overlay},
                 url("{background_url}");
             background-attachment: fixed;
             background-position: center;
             background-size: cover;
+            color: {text};
         }}
         """
 
     st.markdown(
-        """
+        f"""
         <style>
-        __BACKGROUND_CSS__
-        .block-container {
-            padding-top: 1.6rem;
+        {background_css}
+        .block-container {{
+            padding-top: 1.2rem;
             padding-bottom: 2.5rem;
-            max-width: 1100px;
-        }
-        .photo-placeholder {
-            align-items: center;
-            background: #f3f4f6;
-            border: 2px dashed #a3a3a3;
+            max-width: 1120px;
+        }}
+        .stApp, .stMarkdown, p, label, h1, h2, h3 {{
+            color: {text} !important;
+            letter-spacing: 0;
+        }}
+        .player-strip-label {{
+            color: {muted};
+            font-size: 0.8rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            padding-top: 0.7rem;
+            text-align: center;
+            text-transform: uppercase;
+        }}
+        .player-chip {{
+            background: {panel};
+            border: 1px solid {panel_border};
             border-radius: 8px;
-            color: #737373;
-            display: flex;
-            font-size: 2rem;
-            font-weight: 700;
-            justify-content: center;
-        }
-        div[data-testid="stFileUploader"] {
-            width: 112px;
-        }
-        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {
+            min-height: 132px;
+            padding: 0.45rem;
+            text-align: center;
+        }}
+        .player-chip.selected {{
+            border: 3px solid {selected_border};
+            padding: calc(0.45rem - 2px);
+        }}
+        .player-chip img {{
+            aspect-ratio: 1;
+            border-radius: 999px;
+            object-fit: cover;
+        }}
+        .player-chip-placeholder,
+        .photo-placeholder {{
             align-items: center;
-            background: #f3f4f6;
+            background: {placeholder_bg};
+            border: 2px dashed #a3a3a3;
+            color: {placeholder_text};
+            display: flex;
+            font-size: 1.8rem;
+            font-weight: 800;
+            justify-content: center;
+        }}
+        .player-chip-placeholder {{
+            aspect-ratio: 1;
+            border-radius: 999px;
+            width: 100%;
+        }}
+        .photo-placeholder {{
+            border-radius: 8px;
+        }}
+        .player-chip-accent {{
+            border-radius: 999px;
+            height: 4px;
+            margin-top: 0.35rem;
+            width: 100%;
+        }}
+        div[data-testid="stButton"] button {{
+            border-radius: 8px;
+            white-space: normal;
+        }}
+        div[data-testid="stFormSubmitButton"] button[kind="primary"],
+        div[data-testid="stButton"] button[kind="primary"] {{
+            font-size: 1.05rem;
+            font-weight: 800;
+            min-height: 3rem;
+        }}
+        div[data-testid="stMetric"] {{
+            background: {panel};
+            border: 1px solid {panel_border};
+            border-radius: 8px;
+            padding: 0.75rem;
+        }}
+        [data-testid="stMetric"] label,
+        [data-testid="stMetric"] [data-testid="stMetricLabel"],
+        [data-testid="stMetric"] [data-testid="stMetricValue"],
+        [data-testid="stMetric"] p {{
+            color: {text} !important;
+        }}
+        [data-testid="stMetric"] label,
+        [data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+            opacity: 0.78;
+        }}
+        div[data-testid="stFileUploader"] {{
+            width: 112px;
+        }}
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
+            align-items: center;
+            background: {placeholder_bg};
             border: 2px dashed #a3a3a3;
             border-radius: 8px;
             cursor: pointer;
@@ -1398,158 +1630,85 @@ def inject_css(background_url: str = "") -> None:
             padding: 0;
             position: relative;
             width: 112px;
-        }
-        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {
-            color: #737373;
+        }}
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {{
+            color: {placeholder_text};
             content: "+";
             font-size: 2rem;
             font-weight: 800;
             line-height: 1;
-        }
-        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {
+        }}
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {{
             display: none;
-        }
-        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {
+        }}
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
             cursor: pointer;
             height: 112px;
             inset: 0;
             opacity: 0;
             position: absolute;
             width: 112px;
-        }
-        div[data-testid="stFormSubmitButton"] button[kind="primary"],
-        div[data-testid="stButton"] button[kind="primary"] {
-            min-height: 3rem;
-            font-size: 1.05rem;
-            font-weight: 800;
-        }
-        .player-tile-grid {
-            display: grid;
-            gap: 0.75rem;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            margin: 0.75rem 0 1rem;
-        }
-        .player-tile {
-            align-items: center;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 8px;
-            display: grid;
-            gap: 0.85rem;
-            grid-template-columns: 72px minmax(0, 1fr);
-            min-height: 92px;
-            padding: 0.65rem;
-            text-decoration: none !important;
-        }
-        .player-tile.selected {
-            border: 3px solid #ffffff;
-            padding: calc(0.65rem - 2px);
-        }
-        .player-tile-photo,
-        .player-tile-photo img,
-        .player-tile-placeholder {
-            height: 72px;
-            width: 72px;
-        }
-        .player-tile-photo img {
-            border-radius: 8px;
-            object-fit: cover;
-        }
-        .player-tile-placeholder {
-            align-items: center;
-            background: #f3f4f6;
-            border: 2px dashed #a3a3a3;
-            border-radius: 8px;
-            color: #737373;
-            display: flex;
-            font-size: 1.75rem;
-            font-weight: 800;
-            justify-content: center;
-        }
-        .player-tile-name {
-            font-size: 1.45rem;
-            font-weight: 950;
-            line-height: 1.12;
-            overflow-wrap: anywhere;
-        }
-        .player-tile-name span {
-            color: #d4d4d4;
-            display: block;
-            font-size: 0.82rem;
-            font-weight: 800;
-            margin-top: 0.2rem;
-        }
-        [data-testid="stMetric"] {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 8px;
-            padding: 0.75rem;
-        }
-        [data-testid="stMetric"] label,
-        [data-testid="stMetric"] [data-testid="stMetricLabel"],
-        [data-testid="stMetric"] [data-testid="stMetricValue"],
-        [data-testid="stMetric"] p {
-            color: #f9fafb !important;
-        }
-        [data-testid="stMetric"] label,
-        [data-testid="stMetric"] [data-testid="stMetricLabel"] {
-            opacity: 0.78;
-        }
-        h1, h2, h3 {
-            letter-spacing: 0;
-        }
-        @media (max-width: 640px) {
-            .block-container {
+        }}
+        @media (max-width: 760px) {{
+            .block-container {{
                 padding-left: 0.8rem;
                 padding-right: 0.8rem;
-                padding-top: 1rem;
-            }
-            div[data-testid="stHorizontalBlock"] {
-                gap: 0.45rem;
-            }
-            div[data-testid="stMetric"] {
+                padding-top: 0.8rem;
+            }}
+            div[data-testid="stHorizontalBlock"] {{
+                gap: 0.35rem;
+            }}
+            .player-chip {{
+                min-height: 106px;
+                padding: 0.28rem;
+            }}
+            .player-chip.selected {{
+                padding: calc(0.28rem - 2px);
+            }}
+            div[data-testid="stButton"] button {{
+                font-size: 0.72rem;
+                min-height: 2.2rem;
+                padding-left: 0.2rem;
+                padding-right: 0.2rem;
+            }}
+            div[data-testid="stMetric"] {{
                 padding: 0.5rem;
-            }
+            }}
             div[data-testid="stMetric"] label,
-            div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+            div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
                 font-size: 0.85rem;
-            }
+            }}
             div[data-testid="stFileUploader"],
             div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
-            div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {
+            div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
                 height: 92px;
                 min-height: 92px;
                 width: 92px;
-            }
-            .photo-placeholder {
+            }}
+            .photo-placeholder {{
                 max-height: 92px;
                 max-width: 92px;
-            }
-            button {
-                min-height: 2.6rem;
-                white-space: normal;
-            }
-            .player-tile-grid {
-                grid-template-columns: 1fr;
-            }
-            .player-tile-name {
-                font-size: 1.15rem;
-            }
-        }
+            }}
+        }}
         </style>
-        """.replace("__BACKGROUND_CSS__", background_css),
+        """,
         unsafe_allow_html=True,
     )
 
 
 def main() -> None:
     init_db()
-    background_key = night_background_key(active_background_date())
-    inject_css(background_data_url(background_key))
+    background_date = active_background_date()
+    background_key = night_background_key(background_date)
+    inject_css(background_data_url(background_key, background_date))
 
     players = get_players()
-    st.title(APP_TITLE)
-    st.caption("Shared box scores for pickup nights.")
+    header_cols = st.columns([5, 1])
+    with header_cols[0]:
+        st.title(APP_TITLE)
+        st.caption("Shared box scores for pickup nights.")
+    with header_cols[1]:
+        render_theme_toggle()
     render_storage_warning()
 
     tab_game, tab_player, tab_summary, tab_leaderboard, tab_backgrounds, tab_roster = st.tabs(
