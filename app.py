@@ -102,6 +102,7 @@ BACKGROUND_KEYS = {
     "winning": "Winning-night background",
     "losing": "Losing-night background",
 }
+MAX_BACKGROUND_IMAGE_BYTES = 5 * 1024 * 1024
 PLAYER_COLORS = [
     "#ef4444",
     "#3b82f6",
@@ -495,6 +496,31 @@ def migrate_legacy_background_assets(conn) -> None:
         )
 
 
+def dedupe_background_images(conn) -> int:
+    rows = conn.execute(
+        """
+        SELECT id, asset_key, image_blob
+        FROM background_images
+        ORDER BY asset_key, uploaded_at, id
+        """
+    ).fetchall()
+    seen: dict[tuple[str, str], int] = {}
+    duplicate_ids = []
+    for row in rows:
+        data = normalize_row(row)
+        fingerprint = image_fingerprint(data["image_blob"])
+        key = (data["asset_key"], fingerprint)
+        if key in seen:
+            duplicate_ids.append(data["id"])
+        else:
+            seen[key] = data["id"]
+
+    for image_id in duplicate_ids:
+        conn.execute("DELETE FROM background_picks WHERE background_image_id = ?", (image_id,))
+        conn.execute("DELETE FROM background_images WHERE id = ?", (image_id,))
+    return len(duplicate_ids)
+
+
 def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
     columns = table_columns(conn, "game_stats")
     migrations = {
@@ -548,6 +574,7 @@ def init_db() -> None:
     restore_db_from_github_if_needed()
     id_type = "SERIAL PRIMARY KEY" if using_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
     blob_type = "BYTEA" if using_postgres() else "BLOB"
+    duplicate_background_count = 0
     with db() as conn:
         conn.execute(
             f"""
@@ -565,6 +592,7 @@ def init_db() -> None:
         create_app_assets_table(conn)
         create_background_images_table(conn)
         migrate_legacy_background_assets(conn)
+        duplicate_background_count = dedupe_background_images(conn)
         ensure_game_stats_schema(conn)
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
@@ -576,6 +604,8 @@ def init_db() -> None:
                 """,
                 [(name, index, now) for index, name in enumerate(DEFAULT_PLAYERS)],
             )
+    if duplicate_background_count:
+        backup_db_to_github_if_configured()
 
 
 @st.cache_data(ttl=2)
@@ -649,8 +679,21 @@ def get_background_assets(asset_key: str) -> list[dict]:
     return [normalize_row(row) for row in rows]
 
 
-def add_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> None:
+def add_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> bool:
+    new_fingerprint = image_fingerprint(image_bytes)
     with db() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT image_blob
+            FROM background_images
+            WHERE asset_key = ?
+            """,
+            (asset_key,),
+        ).fetchall()
+        for row in existing_rows:
+            data = normalize_row(row)
+            if image_fingerprint(data["image_blob"]) == new_fingerprint:
+                return False
         conn.execute(
             """
             INSERT INTO background_images (asset_key, image_blob, image_mime, uploaded_at)
@@ -660,6 +703,7 @@ def add_background_asset(asset_key: str, image_bytes: bytes, mime_type: str) -> 
         )
     get_background_assets.clear()
     backup_db_to_github_if_configured()
+    return True
 
 
 def remove_background_asset(image_id: int) -> None:
@@ -673,6 +717,10 @@ def remove_background_asset(image_id: int) -> None:
 def asset_to_data_url(asset: dict) -> str:
     encoded = base64.b64encode(asset["image_blob"]).decode("ascii")
     return f"data:{asset['image_mime']};base64,{encoded}"
+
+
+def image_fingerprint(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
 
 
 def deterministic_background_choice(assets: list[dict], asset_key: str, game_date: date) -> dict:
@@ -924,6 +972,33 @@ def select_player(player_id: int) -> None:
     st.session_state.active_player_id = player_id
 
 
+def carousel_player_window(players: list[dict], current_index: int) -> list[tuple[int, dict]]:
+    if len(players) <= 3:
+        return list(enumerate(players))
+    indexes = [
+        (current_index - 1) % len(players),
+        current_index,
+        (current_index + 1) % len(players),
+    ]
+    return [(index, players[index]) for index in indexes]
+
+
+def render_player_avatar(player: dict, size: int = 92) -> None:
+    if player.get("photo_blob"):
+        mime_type = player.get("photo_mime") or "image/png"
+        encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
+        st.markdown(
+            f'<img class="carousel-avatar" src="data:{mime_type};base64,{encoded}" '
+            f'style="width:{size}px;height:{size}px;" alt="">',
+            unsafe_allow_html=True,
+        )
+        return
+    st.markdown(
+        f'<div class="carousel-avatar-placeholder" style="width:{size}px;height:{size}px;">+</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_player_picker(
     players: list[dict],
     current_player_id: int,
@@ -934,49 +1009,42 @@ def render_player_picker(
         (index for index, player in enumerate(players) if player["id"] == current_player_id),
         0,
     )
-    nav_cols = st.columns([1, 8, 1])
-    with nav_cols[0]:
+    st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
+    carousel_cols = st.columns([0.7, 1, 1, 1, 0.7])
+    with carousel_cols[0]:
         if st.button("<", key=f"{scope}_prev_player", use_container_width=True):
             select_player(players[(current_index - 1) % len(players)]["id"])
             st.rerun()
-    with nav_cols[1]:
-        st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
-    with nav_cols[2]:
-        if st.button(">", key=f"{scope}_next_player", use_container_width=True):
-            select_player(players[(current_index + 1) % len(players)]["id"])
-            st.rerun()
 
-    cols = st.columns(len(players))
-    for index, player in enumerate(players):
+    visible_players = carousel_player_window(players, current_index)
+    for column, (index, player) in zip(carousel_cols[1:4], visible_players):
         color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
         selected = player["id"] == current_player_id
         badge = player_badges.get(player["id"], "")
-        with cols[index]:
+        with column:
+            render_player_avatar(player)
             st.markdown(
-                f'<div class="player-chip{" selected" if selected else ""}">',
+                f'<div class="carousel-player-name" style="color:{color};">{player["name"]}</div>',
                 unsafe_allow_html=True,
             )
-            if player.get("photo_blob"):
-                st.image(player["photo_blob"], use_container_width=True)
-            else:
+            if badge:
                 st.markdown(
-                    '<div class="player-chip-placeholder">+</div>',
+                    f'<div class="carousel-player-badge">{badge}</div>',
                     unsafe_allow_html=True,
                 )
             if st.button(
-                player["name"],
+                "Current" if selected else "Select",
                 key=f"{scope}_player_{player['id']}",
                 use_container_width=True,
                 disabled=selected,
             ):
                 select_player(player["id"])
                 st.rerun()
-            if badge:
-                st.caption(badge)
-            st.markdown(
-                f'<div class="player-chip-accent" style="background:{color};"></div></div>',
-                unsafe_allow_html=True,
-            )
+
+    with carousel_cols[4]:
+        if st.button(">", key=f"{scope}_next_player", use_container_width=True):
+            select_player(players[(current_index + 1) % len(players)]["id"])
+            st.rerun()
 
 
 def render_player_header(player: dict) -> None:
@@ -1349,6 +1417,7 @@ def render_player_page(players: list[dict]) -> None:
 def render_backgrounds() -> None:
     st.subheader("Backgrounds")
     st.caption("Upload shared background images. The app picks one consistent image for the selected date and current night outcome.")
+    st.caption(f"Image limit: {MAX_BACKGROUND_IMAGE_BYTES // (1024 * 1024)} MB per file. Large image libraries make the GitHub backup slower.")
     current_date = active_background_date()
     current_key = night_background_key(current_date)
     current_asset = selected_background_asset(current_key, current_date)
@@ -1367,30 +1436,41 @@ def render_backgrounds() -> None:
                 key=f"background_{asset_key}",
             )
             if uploaded is not None:
-                add_background_asset(asset_key, uploaded.getvalue(), uploaded.type)
-                st.success(f"Added {label}.")
-                st.rerun()
+                image_bytes = uploaded.getvalue()
+                upload_fingerprint = image_fingerprint(image_bytes)
+                upload_key = f"last_background_upload_{asset_key}"
+                if len(image_bytes) > MAX_BACKGROUND_IMAGE_BYTES:
+                    st.error(f"{uploaded.name} is too large. Keep each image under {MAX_BACKGROUND_IMAGE_BYTES // (1024 * 1024)} MB.")
+                elif st.session_state.get(upload_key) != upload_fingerprint:
+                    added = add_background_asset(asset_key, image_bytes, uploaded.type)
+                    st.session_state[upload_key] = upload_fingerprint
+                    if added:
+                        st.success(f"Added {label}.")
+                    else:
+                        st.info("That image is already in this background library.")
+                    st.rerun()
 
             if not assets:
                 st.info(f"No {label.lower()} images uploaded yet.")
                 continue
 
-            with st.expander(f"Manage {label.lower()} library"):
-                for index, asset in enumerate(assets, start=1):
-                    cols = st.columns([2, 4, 2])
-                    with cols[0]:
+            for row_start in range(0, len(assets), 3):
+                cols = st.columns(3)
+                for offset, (col, asset) in enumerate(zip(cols, assets[row_start:row_start + 3])):
+                    image_number = row_start + offset + 1
+                    with col:
                         st.image(asset["image_blob"], use_container_width=True)
-                    with cols[1]:
-                        st.write(f"Image {index}")
-                        st.caption(f"Uploaded {asset['uploaded_at']}")
-                    with cols[2]:
+                        st.caption(f"Image {image_number}")
+                        with st.popover("Zoom", use_container_width=True):
+                            st.image(asset["image_blob"], use_container_width=True)
+                            st.caption(f"Uploaded {asset['uploaded_at']}")
                         if st.button(
                             "Remove",
                             key=f"remove_background_{asset_key}_{asset['id']}",
                             use_container_width=True,
                         ):
                             remove_background_asset(asset["id"])
-                            st.success(f"Removed {label} image {index}.")
+                            st.success(f"Removed {label} image {image_number}.")
                             st.rerun()
 
 
@@ -1497,9 +1577,13 @@ def inject_css(background_url: str = "") -> None:
     page_bg = "#101418" if dark else "#f8fafc"
     panel = "rgba(255, 255, 255, 0.06)" if dark else "rgba(255, 255, 255, 0.84)"
     panel_border = "rgba(255, 255, 255, 0.16)" if dark else "rgba(17, 24, 39, 0.14)"
-    selected_border = "#ffffff" if dark else "#111827"
     placeholder_bg = "#f3f4f6" if dark else "#e5e7eb"
     placeholder_text = "#737373" if dark else "#4b5563"
+    widget_bg = "#262632" if dark else "#ffffff"
+    widget_text = "#f9fafb" if dark else "#111827"
+    widget_border = "rgba(255, 255, 255, 0.16)" if dark else "rgba(17, 24, 39, 0.20)"
+    disabled_bg = "#111827" if dark else "#eef2f7"
+    disabled_text = "#9ca3af" if dark else "#111827"
     overlay = (
         "linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9))"
         if dark
@@ -1537,6 +1621,31 @@ def inject_css(background_url: str = "") -> None:
             color: {text} !important;
             letter-spacing: 0;
         }}
+        div[data-testid="stTabs"] button p {{
+            color: {text} !important;
+        }}
+        div[data-testid="stTabs"] button[aria-selected="true"] p {{
+            color: {text} !important;
+            font-weight: 900;
+        }}
+        div[data-baseweb="input"] input,
+        div[data-baseweb="select"] > div,
+        textarea {{
+            background: {widget_bg} !important;
+            border-color: {widget_border} !important;
+            color: {widget_text} !important;
+        }}
+        div[data-baseweb="select"] span,
+        div[data-baseweb="select"] svg,
+        div[data-baseweb="input"] svg {{
+            color: {widget_text} !important;
+            fill: {widget_text} !important;
+        }}
+        div[role="radiogroup"] label,
+        div[role="radiogroup"] p,
+        div[role="radiogroup"] span {{
+            color: {text} !important;
+        }}
         .player-strip-label {{
             color: {muted};
             font-size: 0.8rem;
@@ -1546,51 +1655,65 @@ def inject_css(background_url: str = "") -> None:
             text-align: center;
             text-transform: uppercase;
         }}
-        .player-chip {{
-            background: {panel};
-            border: 1px solid {panel_border};
-            border-radius: 8px;
-            min-height: 132px;
-            padding: 0.45rem;
+        .carousel-player-name {{
+            font-size: 1rem;
+            font-weight: 950;
+            line-height: 1.1;
+            margin: 0.35rem 0 0.2rem;
+            overflow-wrap: anywhere;
             text-align: center;
         }}
-        .player-chip.selected {{
-            border: 3px solid {selected_border};
-            padding: calc(0.45rem - 2px);
+        .carousel-player-badge {{
+            color: {muted};
+            font-size: 0.75rem;
+            font-weight: 800;
+            line-height: 1.1;
+            margin-bottom: 0.25rem;
+            text-align: center;
         }}
-        .player-chip img {{
-            aspect-ratio: 1;
+        .carousel-avatar {{
             border-radius: 999px;
+            display: block;
+            margin: 0 auto;
             object-fit: cover;
         }}
-        .player-chip-placeholder,
+        .carousel-avatar-placeholder,
         .photo-placeholder {{
             align-items: center;
             background: {placeholder_bg};
             border: 2px dashed #a3a3a3;
+            border-radius: 999px;
             color: {placeholder_text};
             display: flex;
             font-size: 1.8rem;
             font-weight: 800;
             justify-content: center;
         }}
-        .player-chip-placeholder {{
-            aspect-ratio: 1;
-            border-radius: 999px;
-            width: 100%;
+        .carousel-avatar-placeholder {{
+            margin: 0 auto;
         }}
         .photo-placeholder {{
             border-radius: 8px;
         }}
-        .player-chip-accent {{
-            border-radius: 999px;
-            height: 4px;
-            margin-top: 0.35rem;
-            width: 100%;
-        }}
         div[data-testid="stButton"] button {{
+            background: {widget_bg} !important;
+            border: 1px solid {widget_border} !important;
             border-radius: 8px;
+            color: {widget_text} !important;
+            font-weight: 800;
             white-space: normal;
+        }}
+        div[data-testid="stButton"] button p {{
+            color: {widget_text} !important;
+        }}
+        div[data-testid="stButton"] button:disabled {{
+            background: {disabled_bg} !important;
+            border-color: {widget_border} !important;
+            color: {disabled_text} !important;
+            opacity: 1 !important;
+        }}
+        div[data-testid="stButton"] button:disabled p {{
+            color: {disabled_text} !important;
         }}
         div[data-testid="stFormSubmitButton"] button[kind="primary"],
         div[data-testid="stButton"] button[kind="primary"] {{
@@ -1658,12 +1781,12 @@ def inject_css(background_url: str = "") -> None:
             div[data-testid="stHorizontalBlock"] {{
                 gap: 0.35rem;
             }}
-            .player-chip {{
-                min-height: 106px;
-                padding: 0.28rem;
+            .player-strip-label {{
+                font-size: 0.72rem;
+                padding-top: 0.45rem;
             }}
-            .player-chip.selected {{
-                padding: calc(0.28rem - 2px);
+            .carousel-player-name {{
+                font-size: 0.78rem;
             }}
             div[data-testid="stButton"] button {{
                 font-size: 0.72rem;
