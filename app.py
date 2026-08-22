@@ -1012,27 +1012,28 @@ def render_player_picker(
             selected = player["id"] == current_player_id
             badge = player_badges.get(player["id"], "")
             with columns[index + 1]:
-                render_player_avatar(player)
-                st.markdown(
-                    (
-                        f'<div class="carousel-player-name" style="color:{color};">'
-                        f'{html.escape(player["name"])}</div>'
-                    ),
-                    unsafe_allow_html=True,
-                )
-                if badge:
+                with st.container(key=f"{scope}_player_tile_{player['id']}"):
+                    render_player_avatar(player)
                     st.markdown(
-                        f'<div class="carousel-player-badge">{html.escape(badge)}</div>',
+                        (
+                            f'<div class="carousel-player-name" style="color:{color};">'
+                            f'{html.escape(player["name"])}</div>'
+                        ),
                         unsafe_allow_html=True,
                     )
-                if st.button(
-                    "Current" if selected else "Select",
-                    key=f"{scope}_player_{player['id']}",
-                    use_container_width=True,
-                    disabled=selected,
-                ):
-                    select_player(player["id"])
-                    st.rerun()
+                    if badge:
+                        st.markdown(
+                            f'<div class="carousel-player-badge">{html.escape(badge)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    if st.button(
+                        "Current" if selected else "Select",
+                        key=f"{scope}_player_{player['id']}",
+                        use_container_width=True,
+                        disabled=selected,
+                    ):
+                        select_player(player["id"])
+                        st.rerun()
 
         with columns[-1]:
             if st.button(">", key=f"{scope}_next_player", use_container_width=True):
@@ -1722,6 +1723,41 @@ def inject_css(background_url: str = "") -> None:
             min-width: 3.4rem !important;
             width: 3.4rem !important;
         }}
+        [class*="st-key-player_page_player_tile_"] {{
+            cursor: pointer;
+            min-height: 7.4rem;
+            position: relative;
+        }}
+        [class*="st-key-player_page_player_tile_"] .carousel-avatar,
+        [class*="st-key-player_page_player_tile_"] .carousel-avatar-placeholder {{
+            cursor: pointer;
+        }}
+        [class*="st-key-player_page_player_"][data-testid="stElementContainer"] {{
+            height: 0;
+            left: 50%;
+            overflow: visible;
+            position: absolute;
+            top: 0;
+            transform: translateX(-50%);
+            width: 92px;
+            z-index: 5;
+        }}
+        [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button {{
+            background: transparent !important;
+            border: 0 !important;
+            border-radius: 999px;
+            box-shadow: none !important;
+            color: transparent !important;
+            cursor: pointer;
+            height: 92px;
+            min-height: 92px;
+            opacity: 0;
+            padding: 0;
+            width: 92px;
+        }}
+        [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button * {{
+            color: transparent !important;
+        }}
         div[data-testid="stButton"] button {{
             background: {widget_bg} !important;
             border: 1px solid {widget_border} !important;
@@ -1746,6 +1782,16 @@ def inject_css(background_url: str = "") -> None:
         }}
         div[data-testid="stButton"] button:disabled p {{
             color: {disabled_text} !important;
+        }}
+        [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button:disabled {{
+            background: transparent !important;
+            border: 0 !important;
+            color: transparent !important;
+            cursor: default;
+            opacity: 0 !important;
+        }}
+        [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button:disabled * {{
+            color: transparent !important;
         }}
         div[data-testid="stFormSubmitButton"] button[kind="primary"],
         div[data-testid="stButton"] button[kind="primary"] {{
