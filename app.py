@@ -1506,10 +1506,23 @@ def render_roster(players: list[dict]) -> None:
     st.caption("Rename the seven player slots and manage profile photos.")
 
     for player in players:
-        with st.container(border=True):
+        with st.container(border=True, key=f"roster_row_{player['id']}"):
             cols = st.columns([1, 4, 2])
             with cols[0]:
-                render_photo(player, size=84)
+                if player.get("photo_blob"):
+                    render_photo(player, size=84)
+                else:
+                    with st.container(key=f"roster_photo_tile_{player['id']}"):
+                        uploaded = st.file_uploader(
+                            f"Add photo for {player['name']}",
+                            type=["png", "jpg", "jpeg", "webp"],
+                            key=f"roster_photo_{player['id']}",
+                            label_visibility="collapsed",
+                        )
+                    if uploaded is not None:
+                        update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+                        st.success("Photo saved.")
+                        st.rerun()
             with cols[1]:
                 new_name = st.text_input(
                     "Player name",
@@ -1521,20 +1534,24 @@ def render_roster(players: list[dict]) -> None:
                     st.success("Name saved.")
                     st.rerun()
             with cols[2]:
-                with st.container(key=f"roster_photo_controls_{player['id']}"):
-                    uploaded = st.file_uploader(
-                        "Replace photo" if player.get("photo_blob") else "Add photo",
-                        type=["png", "jpg", "jpeg", "webp"],
-                        key=f"roster_photo_{player['id']}",
-                    )
-                    if uploaded is not None:
-                        update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
-                        st.success("Photo saved.")
-                        st.rerun()
-                if player.get("photo_blob") and st.button("Remove photo", key=f"remove_photo_{player['id']}"):
-                    remove_player_photo(player["id"])
-                    st.success("Photo removed.")
-                    st.rerun()
+                if player.get("photo_blob"):
+                    with st.container(key=f"roster_photo_actions_{player['id']}"):
+                        with st.container(key=f"roster_change_photo_{player['id']}"):
+                            uploaded = st.file_uploader(
+                                f"Change photo for {player['name']}",
+                                type=["png", "jpg", "jpeg", "webp"],
+                                key=f"roster_photo_{player['id']}",
+                                label_visibility="collapsed",
+                            )
+                            if uploaded is not None:
+                                update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+                                st.success("Photo saved.")
+                                st.rerun()
+                        with st.container(key=f"roster_remove_photo_{player['id']}"):
+                            if st.button("Remove Photo", key=f"remove_photo_{player['id']}"):
+                                remove_player_photo(player["id"])
+                                st.success("Photo removed.")
+                                st.rerun()
 
 
 def inject_css(background_url: str = "") -> None:
@@ -1808,10 +1825,28 @@ def inject_css(background_url: str = "") -> None:
             position: absolute;
             width: 112px;
         }}
-        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] {{
+        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] {{
+            width: 84px;
+        }}
+        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
+            height: 84px;
+            min-height: 84px;
+            width: 84px;
+        }}
+        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+            height: 84px;
+            width: 84px;
+        }}
+        [class*="st-key-roster_photo_actions_"] {{
+            max-width: 9.5rem;
+        }}
+        [class*="st-key-roster_photo_actions_"] div[data-testid="stVerticalBlock"] {{
+            gap: 0.35rem;
+        }}
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] {{
             width: 100%;
         }}
-        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
             background: transparent;
             border: 0;
             border-radius: 0;
@@ -1821,24 +1856,56 @@ def inject_css(background_url: str = "") -> None:
             padding: 0;
             width: 100%;
         }}
-        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {{
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {{
             content: none;
         }}
-        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {{
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {{
             display: none;
         }}
-        [class*="st-key-roster_photo_controls_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
             background: {widget_bg} !important;
             border: 1px solid {widget_border} !important;
             border-radius: 8px;
-            color: {widget_text} !important;
+            color: transparent !important;
             cursor: pointer;
+            font-size: 0;
             font-weight: 800;
             height: auto;
+            min-height: 2rem;
             opacity: 1;
-            padding: 0.45rem 0.65rem;
-            position: static;
+            padding: 0.35rem 0.55rem;
+            position: relative;
             width: 100%;
+        }}
+        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button::after {{
+            color: {widget_text};
+            content: "Change Photo";
+            font-size: 0.78rem;
+            line-height: 1.1;
+        }}
+        [class*="st-key-roster_remove_photo_"] div[data-testid="stButton"] button {{
+            font-size: 0.78rem;
+            min-height: 2rem;
+            padding: 0.35rem 0.55rem;
+        }}
+        [class*="st-key-roster_row_"] div[data-testid="stHorizontalBlock"] {{
+            align-items: start;
+            flex-wrap: nowrap !important;
+            gap: 0.75rem;
+        }}
+        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:first-child {{
+            flex: 0 0 5.25rem !important;
+            min-width: 5.25rem !important;
+            width: 5.25rem !important;
+        }}
+        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:nth-child(2) {{
+            flex: 1 1 auto !important;
+            min-width: 8rem !important;
+        }}
+        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:last-child {{
+            flex: 0 0 9.5rem !important;
+            min-width: 9.5rem !important;
+            width: 9.5rem !important;
         }}
         @media (max-width: 760px) {{
             .block-container {{
@@ -1902,6 +1969,43 @@ def inject_css(background_url: str = "") -> None:
             .photo-placeholder {{
                 max-height: 92px;
                 max-width: 92px;
+            }}
+            [class*="st-key-roster_row_"] {{
+                overflow-x: auto;
+                padding-bottom: 0.2rem;
+            }}
+            [class*="st-key-roster_row_"] div[data-testid="stHorizontalBlock"] {{
+                gap: 0.5rem;
+                min-width: 21rem;
+            }}
+            [class*="st-key-roster_row_"] div[data-testid="stColumn"]:first-child {{
+                flex-basis: 4.75rem !important;
+                min-width: 4.75rem !important;
+                width: 4.75rem !important;
+            }}
+            [class*="st-key-roster_row_"] div[data-testid="stColumn"]:last-child {{
+                flex-basis: 7.4rem !important;
+                min-width: 7.4rem !important;
+                width: 7.4rem !important;
+            }}
+            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"],
+            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
+            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+                height: 76px;
+                min-height: 76px;
+                width: 76px;
+            }}
+            [class*="st-key-roster_photo_actions_"] {{
+                max-width: 7.4rem;
+            }}
+            [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button,
+            [class*="st-key-roster_remove_photo_"] div[data-testid="stButton"] button {{
+                font-size: 0.68rem;
+                min-height: 1.85rem;
+                padding: 0.25rem 0.35rem;
+            }}
+            [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button::after {{
+                font-size: 0.68rem;
             }}
         }}
         </style>
