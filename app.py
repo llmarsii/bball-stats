@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 import hashlib
 import html
 import json
@@ -119,6 +120,32 @@ PLAYER_COLORS = [
     "#06b6d4",
     "#f97316",
 ]
+PERCENT_COLUMNS = {"FG%", "3P%", "WIN%"}
+AVERAGE_COLUMNS = {"PPG", "RPG", "APG", "SPG", "BPG", "TPG", "FGM/G", "FGA/G", "3PM/G", "3PA/G"}
+WEEKDAY_ABBREVIATIONS = ["M", "Tu", "W", "Th", "F", "Sa", "Su"]
+CUSTOM_STAT_FIELDS = [
+    "GP",
+    "Nights",
+    "W",
+    "L",
+    "PTS",
+    "FGM",
+    "FGA",
+    "REB",
+    "AST",
+    "STL",
+    "BLK",
+    "THREE_PM",
+    "THREE_PA",
+    "TO",
+    "WIN_PCT",
+    "FG_PCT",
+    "THREE_PCT",
+    "PPG",
+    "RPG",
+    "APG",
+]
+CUSTOM_STAT_OPERATORS = ["+", "-", "*", "/", "(", ")", "**"]
 
 
 st.set_page_config(
@@ -471,6 +498,35 @@ def create_background_images_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def create_game_nights_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_nights (
+            game_date TEXT PRIMARY KEY,
+            location_name TEXT NOT NULL DEFAULT '',
+            maps_url TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def create_custom_stats_table(conn: sqlite3.Connection) -> None:
+    id_type = "SERIAL PRIMARY KEY" if using_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS custom_stats (
+            id {id_type},
+            name TEXT NOT NULL,
+            formula TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 def migrate_legacy_background_assets(conn) -> None:
     for asset_key in BACKGROUND_KEYS:
         existing_count = conn.execute(
@@ -598,6 +654,8 @@ def init_db() -> None:
         create_game_stats_table(conn)
         create_app_assets_table(conn)
         create_background_images_table(conn)
+        create_game_nights_table(conn)
+        create_custom_stats_table(conn)
         migrate_legacy_background_assets(conn)
         duplicate_background_count = dedupe_background_images(conn)
         ensure_game_stats_schema(conn)
@@ -668,6 +726,94 @@ def remove_player_photo(player_id: int) -> None:
             (datetime.utcnow().isoformat(), player_id),
         )
     get_players.clear()
+    backup_db_to_github_if_configured()
+
+
+def google_maps_search_url(location_name: str) -> str:
+    query = urllib.parse.quote_plus(location_name.strip())
+    return f"https://www.google.com/maps/search/?api=1&query={query}" if query else ""
+
+
+def game_night_metadata(game_date: date) -> dict:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT game_date, location_name, maps_url, updated_at
+            FROM game_nights
+            WHERE game_date = ?
+            """,
+            (game_date.isoformat(),),
+        ).fetchone()
+    return normalize_row(row) if row else {"location_name": "", "maps_url": ""}
+
+
+def saved_locations() -> list[str]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT location_name
+            FROM game_nights
+            WHERE location_name <> ''
+            ORDER BY location_name
+            """
+        ).fetchall()
+    return [row["location_name"] for row in rows]
+
+
+def save_game_night_location(game_date: date, location_name: str) -> None:
+    clean_location = location_name.strip()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO game_nights (game_date, location_name, maps_url, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(game_date) DO UPDATE SET
+                location_name = excluded.location_name,
+                maps_url = excluded.maps_url,
+                updated_at = excluded.updated_at
+            """,
+            (
+                game_date.isoformat(),
+                clean_location,
+                google_maps_search_url(clean_location),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+    backup_db_to_github_if_configured()
+
+
+def remove_game_night_location(game_date: date) -> None:
+    save_game_night_location(game_date, "")
+
+
+def get_custom_stats() -> list[dict]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, formula, description, created_at, updated_at
+            FROM custom_stats
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+    return [normalize_row(row) for row in rows]
+
+
+def add_custom_stat(name: str, formula: str, description: str) -> None:
+    now = datetime.utcnow().isoformat()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO custom_stats (name, formula, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (name.strip(), formula.strip(), description.strip(), now, now),
+        )
+    backup_db_to_github_if_configured()
+
+
+def delete_custom_stat(custom_stat_id: int) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM custom_stats WHERE id = ?", (custom_stat_id,))
     backup_db_to_github_if_configured()
 
 
@@ -930,6 +1076,130 @@ def format_game_date(game_date: date) -> str:
     return f"{game_date:%b} {game_date.day}, {game_date:%Y}"
 
 
+def format_date_with_weekday(game_date: date) -> str:
+    return f"{game_date:%Y-%m-%d} {WEEKDAY_ABBREVIATIONS[game_date.weekday()]}"
+
+
+def parse_game_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def saved_game_dates(df: pd.DataFrame | None = None) -> list[date]:
+    stats_df = all_stats() if df is None else df
+    if stats_df.empty or "game_date" not in stats_df:
+        return []
+    dates = {parsed for parsed in (parse_game_date(value) for value in stats_df["game_date"]) if parsed}
+    return sorted(dates, reverse=True)
+
+
+def formatted_metric_average(value: float) -> str:
+    return f"{value:.1f}"
+
+
+def format_stats_dataframe(
+    display: pd.DataFrame,
+    percent_columns: set[str] | None = None,
+    average_columns: set[str] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    formatted = display.copy()
+    column_config = {}
+    percent_labels = percent_columns or PERCENT_COLUMNS
+    average_labels = average_columns or AVERAGE_COLUMNS
+
+    for column in formatted.columns:
+        if column in percent_labels:
+            formatted[column] = pd.to_numeric(formatted[column], errors="coerce") * 100
+            column_config[column] = st.column_config.NumberColumn(column, format="%.1f%%")
+        elif column in average_labels:
+            formatted[column] = pd.to_numeric(formatted[column], errors="coerce")
+            column_config[column] = st.column_config.NumberColumn(column, format="%.1f")
+    return formatted, column_config
+
+
+def render_stats_dataframe(display: pd.DataFrame, **kwargs) -> None:
+    formatted, column_config = format_stats_dataframe(display)
+    st.dataframe(formatted, column_config=column_config, **kwargs)
+
+
+def formula_alias(column: str) -> str:
+    return (
+        column.upper()
+        .replace("%", "_PCT")
+        .replace("3P", "THREE")
+        .replace("/", "_")
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+
+
+def safe_formula_value(node: ast.AST, variables: dict[str, float]) -> float:
+    if isinstance(node, ast.Expression):
+        return safe_formula_value(node.body, variables)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        if node.id not in variables:
+            raise ValueError(f"Unknown field: {node.id}")
+        return float(variables[node.id])
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = safe_formula_value(node.operand, variables)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+        left = safe_formula_value(node.left, variables)
+        right = safe_formula_value(node.right, variables)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right if right else 0.0
+        if abs(right) > 8:
+            raise ValueError("Exponent is too large")
+        return left**right
+    raise ValueError("Use only fields, numbers, parentheses, and + - * / **")
+
+
+def evaluate_custom_formula(formula: str, variables: dict[str, float]) -> float:
+    parsed = ast.parse(formula, mode="eval")
+    if sum(1 for _ in ast.walk(parsed)) > 80:
+        raise ValueError("Formula is too long")
+    value = safe_formula_value(parsed, variables)
+    if abs(value) > 1_000_000_000:
+        raise ValueError("Formula result is too large")
+    return round(value, 1)
+
+
+def add_custom_stat_columns(df: pd.DataFrame, custom_stats: list[dict]) -> tuple[pd.DataFrame, list[str], list[str]]:
+    result = df.copy()
+    custom_columns = []
+    errors = []
+    for custom_stat in custom_stats:
+        name = custom_stat["name"].strip()
+        formula = custom_stat["formula"].strip()
+        if not name or not formula:
+            continue
+        values = []
+        try:
+            for _, row in result.iterrows():
+                variables = {}
+                for column, value in row.items():
+                    numeric_value = pd.to_numeric(value, errors="coerce")
+                    if pd.isna(numeric_value):
+                        numeric_value = 0
+                    variables[formula_alias(str(column))] = float(numeric_value)
+                values.append(evaluate_custom_formula(formula, variables))
+            result[name] = values
+            custom_columns.append(name)
+        except (SyntaxError, ValueError, OverflowError, ZeroDivisionError) as exc:
+            errors.append(f"{name}: {exc}")
+    return result, custom_columns, errors
+
+
 def app_today() -> date:
     if APP_TIME_ZONE is None:
         return date.today()
@@ -1012,43 +1282,46 @@ def render_player_picker(
         0,
     )
     with st.container(key=f"{scope}_player_picker"):
-        st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
-        columns = st.columns([0.56, *([1] * len(players)), 0.56])
-        with columns[0]:
-            if st.button("<", key=f"{scope}_prev_player", use_container_width=True):
+        nav_cols = st.columns([0.55, 8, 0.55])
+        with nav_cols[0]:
+            if st.button("‹", key=f"{scope}_prev_player", use_container_width=True, help="Previous player"):
                 select_player(players[(current_index - 1) % len(players)]["id"])
                 st.rerun()
 
-        for index, player in enumerate(players):
-            color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
-            selected = player["id"] == current_player_id
-            badge = player_badges.get(player["id"], "")
-            with columns[index + 1]:
-                with st.container(key=f"{scope}_player_tile_{player['id']}"):
-                    render_player_avatar(player)
-                    st.markdown(
-                        (
-                            f'<div class="carousel-player-name" style="color:{color};">'
-                            f'{html.escape(player["name"])}</div>'
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                    if badge:
-                        st.markdown(
-                            f'<div class="carousel-player-badge">{html.escape(badge)}</div>',
-                            unsafe_allow_html=True,
-                        )
-                    if st.button(
-                        "Current" if selected else "Select",
-                        key=f"{scope}_player_{player['id']}",
-                        use_container_width=True,
-                        disabled=selected,
-                    ):
-                        select_player(player["id"])
-                        st.rerun()
+        with nav_cols[1]:
+            with st.container(key=f"{scope}_player_bus"):
+                st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
+                columns = st.columns(len(players))
+                for index, player in enumerate(players):
+                    color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
+                    selected = player["id"] == current_player_id
+                    badge = player_badges.get(player["id"], "")
+                    with columns[index]:
+                        with st.container(key=f"{scope}_player_tile_{player['id']}"):
+                            render_player_avatar(player, size=64)
+                            st.markdown(
+                                (
+                                    f'<div class="carousel-player-name" style="color:{color};">'
+                                    f'{html.escape(player["name"])}</div>'
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            if badge:
+                                st.markdown(
+                                    f'<div class="carousel-player-badge">{html.escape(badge)}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            if st.button(
+                                "Current" if selected else "Select",
+                                key=f"{scope}_player_{player['id']}",
+                                use_container_width=True,
+                                disabled=selected,
+                            ):
+                                select_player(player["id"])
+                                st.rerun()
 
-        with columns[-1]:
-            if st.button(">", key=f"{scope}_next_player", use_container_width=True):
+        with nav_cols[2]:
+            if st.button("›", key=f"{scope}_next_player", use_container_width=True, help="Next player"):
                 select_player(players[(current_index + 1) % len(players)]["id"])
                 st.rerun()
 
@@ -1070,8 +1343,8 @@ def render_player_stats_detail(player: dict) -> None:
     total_games = int(history["games"].sum())
     metric_cols[0].metric("Games", total_games)
     metric_cols[1].metric("Wins", int(history["wins"].sum()))
-    metric_cols[2].metric("PPG", round(history["points"].sum() / total_games, 1))
-    metric_cols[3].metric("RPG", round(history["rebounds"].sum() / total_games, 1))
+    metric_cols[2].metric("PPG", formatted_metric_average(history["points"].sum() / total_games))
+    metric_cols[3].metric("RPG", formatted_metric_average(history["rebounds"].sum() / total_games))
 
     display_columns = list(PLAYER_NIGHT_COLUMNS.keys())
     display_columns.remove("name")
@@ -1080,7 +1353,7 @@ def render_player_stats_detail(player: dict) -> None:
             **PLAYER_NIGHT_COLUMNS,
         }
     )
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    render_stats_dataframe(display, use_container_width=True, hide_index=True)
     st.download_button(
         "Download Player CSV",
         data=display.to_csv(index=False),
@@ -1098,7 +1371,7 @@ def render_player_stats_detail(player: dict) -> None:
                 **GAME_LOG_COLUMNS,
             }
         )
-        st.dataframe(game_display, use_container_width=True, hide_index=True)
+        render_stats_dataframe(game_display, use_container_width=True, hide_index=True)
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -1166,6 +1439,37 @@ def render_photo(player: dict, size: int = 96) -> None:
         f'<div class="photo-placeholder" style="width:{size}px;height:{size}px;">+</div>',
         unsafe_allow_html=True,
     )
+
+
+def render_player_photo_manager(player: dict, scope: str) -> None:
+    with st.container(border=True, key=f"{scope}_photo_manager_{player['id']}"):
+        cols = st.columns([1, 3, 2])
+        with cols[0]:
+            render_photo(player, size=92)
+        with cols[1]:
+            st.markdown("#### Profile photo")
+            st.caption("Add, change, or remove this player's profile picture.")
+            uploaded = st.file_uploader(
+                "Add or change profile photo",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"{scope}_photo_upload_{player['id']}",
+            )
+            if uploaded is not None:
+                update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+                st.success("Profile photo saved.")
+                st.rerun()
+        with cols[2]:
+            st.write("")
+            st.write("")
+            if player.get("photo_blob"):
+                if st.button(
+                    "Remove Photo",
+                    key=f"{scope}_remove_photo_{player['id']}",
+                    use_container_width=True,
+                ):
+                    remove_player_photo(player["id"])
+                    st.success("Profile photo removed.")
+                    st.rerun()
 
 
 def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict) -> None:
@@ -1271,12 +1575,60 @@ def render_saved_stat_line(player: dict, game_date: date, game_number: int, stat
             st.rerun()
 
 
+def render_game_location(game_date: date) -> None:
+    metadata = game_night_metadata(game_date)
+    locations = saved_locations()
+    current_location = metadata.get("location_name", "")
+    location_options = ["Add or type location", *locations]
+    if current_location and current_location not in locations:
+        location_options.append(current_location)
+    selected_index = (
+        location_options.index(current_location)
+        if current_location in location_options
+        else 0
+    )
+
+    with st.container(border=True, key=f"game_location_{game_date}"):
+        cols = st.columns([2, 4, 1.4])
+        with cols[0]:
+            selected_location = st.selectbox(
+                "Saved locations",
+                options=location_options,
+                index=selected_index,
+                key=f"location_select_{game_date}",
+            )
+        location_value = current_location if selected_location == "Add or type location" else selected_location
+        with cols[1]:
+            typed_location = st.text_input(
+                "Game location",
+                value=location_value,
+                key=f"location_input_{game_date}",
+                placeholder="Great Park, Irvine CA",
+            )
+        with cols[2]:
+            st.write("")
+            if st.button("Save Location", key=f"save_location_{game_date}", use_container_width=True):
+                save_game_night_location(game_date, typed_location)
+                st.success("Location saved.")
+                st.rerun()
+
+        maps_url = google_maps_search_url(typed_location) or metadata.get("maps_url", "")
+        if maps_url:
+            st.markdown(f"[Open in Google Maps]({maps_url})")
+        if current_location:
+            if st.button("Clear Location", key=f"clear_location_{game_date}"):
+                remove_game_night_location(game_date)
+                st.rerun()
+
+
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
     game_date = st.date_input("Playing date", value=app_today(), key="playing_date")
+    render_game_location(game_date)
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
     st.caption("Select a player, then enter one game at a time. The next game opens automatically after saving.")
+    st.info("To upload or change a player photo, go to the Roster tab or Player Page tab.")
     render_player_picker(players, current_player_id, player_badges, scope="game_night")
 
     current_player = next(player for player in players if player["id"] == current_player_id)
@@ -1309,7 +1661,16 @@ def render_game_night(players: list[dict]) -> None:
 
 def render_nightly_summary() -> None:
     st.subheader("Nightly Summary")
-    game_date = st.date_input("Summary date", value=app_today(), key="summary_date")
+    dates = saved_game_dates()
+    if dates:
+        game_date = st.selectbox(
+            "Summary date",
+            options=dates,
+            key="summary_date",
+            format_func=format_date_with_weekday,
+        )
+    else:
+        game_date = st.date_input("Summary date", value=app_today(), key="summary_date")
     summary = nightly_summary(game_date)
     game_log = nightly_game_log(game_date)
 
@@ -1319,7 +1680,7 @@ def render_nightly_summary() -> None:
 
     display = summary[list(NIGHTLY_TOTAL_COLUMNS.keys())].rename(columns=NIGHTLY_TOTAL_COLUMNS)
     st.caption("Nightly totals across all games. Click any column header to sort.")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    render_stats_dataframe(display, use_container_width=True, hide_index=True)
     st.download_button(
         "Download Nightly Totals CSV",
         data=display.to_csv(index=False),
@@ -1329,7 +1690,7 @@ def render_nightly_summary() -> None:
 
     with st.expander("Game-by-game log"):
         game_display = game_log[list(GAME_LOG_COLUMNS.keys())].rename(columns=GAME_LOG_COLUMNS)
-        st.dataframe(game_display, use_container_width=True, hide_index=True)
+        render_stats_dataframe(game_display, use_container_width=True, hide_index=True)
         st.download_button(
             "Download Game Log CSV",
             data=game_display.to_csv(index=False),
@@ -1385,6 +1746,7 @@ def render_player_page(players: list[dict]) -> None:
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
     render_player_picker(players, current_player_id, {}, scope="player_page")
+    render_player_photo_manager(current_player, "player_page")
     render_player_stats_detail(current_player)
 
 
@@ -1448,6 +1810,75 @@ def render_backgrounds() -> None:
                             st.rerun()
 
 
+def append_custom_formula_piece(piece: str) -> None:
+    key = "leaderboard_custom_formula"
+    current = st.session_state.get(key, "").strip()
+    spacer = " " if current and piece not in [")"] else ""
+    st.session_state[key] = f"{current}{spacer}{piece}".strip()
+
+
+def render_custom_stat_builder() -> list[dict]:
+    custom_stats = get_custom_stats()
+    with st.expander("Custom leaderboard stats"):
+        if custom_stats:
+            st.caption("Saved custom stats")
+            for custom_stat in custom_stats:
+                cols = st.columns([3, 5, 1.4])
+                with cols[0]:
+                    st.markdown(f"**{custom_stat['name']}**")
+                    if custom_stat["description"]:
+                        st.caption(custom_stat["description"])
+                with cols[1]:
+                    st.code(custom_stat["formula"], language="text")
+                with cols[2]:
+                    if st.button("Delete", key=f"delete_custom_stat_{custom_stat['id']}", use_container_width=True):
+                        delete_custom_stat(custom_stat["id"])
+                        st.rerun()
+
+        st.caption("Build a formula from leaderboard fields. Use `FG_PCT`, `THREE_PCT`, and `WIN_PCT` for percentage fields.")
+        if "leaderboard_custom_formula" not in st.session_state:
+            st.session_state.leaderboard_custom_formula = ""
+        builder_cols = st.columns([2, 1, 1.2, 1])
+        with builder_cols[0]:
+            selected_field = st.selectbox("Field", CUSTOM_STAT_FIELDS, key="custom_stat_field")
+        with builder_cols[1]:
+            if st.button("Add Field", key="append_custom_field", use_container_width=True):
+                append_custom_formula_piece(selected_field)
+                st.rerun()
+        with builder_cols[2]:
+            selected_operator = st.selectbox("Operation", CUSTOM_STAT_OPERATORS, key="custom_stat_operator")
+        with builder_cols[3]:
+            if st.button("Add Op", key="append_custom_operator", use_container_width=True):
+                append_custom_formula_piece(selected_operator)
+                st.rerun()
+
+        name = st.text_input("Custom stat name", key="leaderboard_custom_name", placeholder="Bus Rider Score")
+        formula = st.text_input(
+            "Formula",
+            key="leaderboard_custom_formula",
+            placeholder="PTS*0.7 + (FGM-FGA)*0.7 + 2*REB - 2*TO",
+        )
+        description = st.text_input(
+            "Description / comment",
+            key="leaderboard_custom_description",
+            placeholder="Rewards scoring, efficiency, rebounding, and ball security.",
+        )
+        if st.button("Add Custom Stat", type="primary", key="save_custom_stat"):
+            if not name.strip() or not formula.strip():
+                st.error("Add both a custom stat name and formula.")
+            else:
+                try:
+                    sample_variables = {field: 1.0 for field in CUSTOM_STAT_FIELDS}
+                    evaluate_custom_formula(formula, sample_variables)
+                except (SyntaxError, ValueError, OverflowError, ZeroDivisionError) as exc:
+                    st.error(f"Formula needs a fix: {exc}")
+                else:
+                    add_custom_stat(name, formula, description)
+                    st.success("Custom stat added.")
+                    st.rerun()
+    return custom_stats
+
+
 def render_leaderboard() -> None:
     st.subheader("Leaderboards")
     df = all_stats()
@@ -1455,10 +1886,47 @@ def render_leaderboard() -> None:
         st.info("No stat lines have been saved yet.")
         return
 
-    completed = df[df["result"].isin(["W", "L"])].copy()
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Stat lines", len(df))
+    metric_cols[1].metric("Game nights", df["game_date"].nunique())
+    metric_cols[2].metric("Total points", int(df["points"].sum()))
+    metric_cols[3].metric("Photos", sum(1 for player in get_players() if player.get("photo_blob")))
+
+    control_cols = st.columns([1.2, 2.8])
+    with control_cols[0]:
+        leaderboard_view = st.selectbox(
+            "Leaderboard view",
+            options=["Totals", "Per game averages"],
+            key="leaderboard_view",
+        )
+    date_labels = {format_date_with_weekday(game_date): game_date for game_date in saved_game_dates(df)}
+    night_options = ["ALL GAMES", *date_labels.keys()]
+    with control_cols[1]:
+        selected_nights = st.multiselect(
+            "Game nights",
+            options=night_options,
+            default=["ALL GAMES"],
+            key="leaderboard_nights",
+        )
+
+    filtered = df.copy()
+    if selected_nights and "ALL GAMES" not in selected_nights:
+        selected_dates = {date_labels[label].isoformat() for label in selected_nights if label in date_labels}
+        filtered = filtered[filtered["game_date"].isin(selected_dates)]
+
+    custom_stats = render_custom_stat_builder()
+
+    completed = filtered[filtered["result"].isin(["W", "L"])].copy()
     if completed.empty:
         st.info("Saved rows need W/L results before standings can be calculated.")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
+        display_df = add_percentages(filtered)[display_columns].rename(
+            columns={
+                "game_date": "Date",
+                **GAME_LOG_COLUMNS,
+            }
+        )
+        render_stats_dataframe(display_df, use_container_width=True, hide_index=True)
         return
 
     grouped = completed.groupby("name", as_index=False).agg(
@@ -1485,23 +1953,79 @@ def render_leaderboard() -> None:
     grouped["APG"] = (grouped["AST"] / grouped["GP"]).round(1)
     grouped = grouped.sort_values(["W", "WIN%", "PPG"], ascending=False)
 
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Stat lines", len(df))
-    metric_cols[1].metric("Game nights", df["game_date"].nunique())
-    metric_cols[2].metric("Total points", int(df["points"].sum()))
-    metric_cols[3].metric("Photos", sum(1 for player in get_players() if player.get("photo_blob")))
+    if leaderboard_view == "Per game averages":
+        grouped["FGM/G"] = (grouped["FGM"] / grouped["GP"]).round(1)
+        grouped["FGA/G"] = (grouped["FGA"] / grouped["GP"]).round(1)
+        grouped["3PM/G"] = (grouped["THREE_PM"] / grouped["GP"]).round(1)
+        grouped["3PA/G"] = (grouped["THREE_PA"] / grouped["GP"]).round(1)
+        grouped["SPG"] = (grouped["STL"] / grouped["GP"]).round(1)
+        grouped["BPG"] = (grouped["BLK"] / grouped["GP"]).round(1)
+        grouped["TPG"] = (grouped["TO"] / grouped["GP"]).round(1)
+        display_columns = [
+            "name",
+            "GP",
+            "Nights",
+            "W",
+            "L",
+            "WIN%",
+            "PPG",
+            "FG%",
+            "3P%",
+            "RPG",
+            "APG",
+            "SPG",
+            "BPG",
+            "TPG",
+            "FGM/G",
+            "FGA/G",
+            "3PM/G",
+            "3PA/G",
+        ]
+    else:
+        display_columns = [
+            "name",
+            "GP",
+            "Nights",
+            "W",
+            "L",
+            "PTS",
+            "FGM",
+            "FGA",
+            "REB",
+            "AST",
+            "STL",
+            "BLK",
+            "THREE_PM",
+            "THREE_PA",
+            "TO",
+            "WIN%",
+            "PPG",
+            "FG%",
+            "3P%",
+            "RPG",
+            "APG",
+        ]
 
-    st.dataframe(grouped, use_container_width=True, hide_index=True)
+    display = grouped[display_columns].copy()
+    display, custom_columns, custom_errors = add_custom_stat_columns(display, custom_stats)
+    for error in custom_errors:
+        st.warning(f"Custom stat skipped: {error}")
+
+    formatted, column_config = format_stats_dataframe(
+        display,
+        average_columns=AVERAGE_COLUMNS | set(custom_columns),
+    )
+    st.dataframe(formatted, column_config=column_config, use_container_width=True, hide_index=True)
 
     with st.expander("All saved stat lines"):
         display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
-        display_df = add_percentages(df)[display_columns].rename(
+        display_df = add_percentages(filtered)[display_columns].rename(
             columns={
                 "game_date": "Date",
                 **GAME_LOG_COLUMNS,
             }
         )
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        render_stats_dataframe(display_df, use_container_width=True, hide_index=True)
         st.download_button(
             "Download CSV",
             data=display_df.to_csv(index=False),
@@ -1566,16 +2090,16 @@ def render_roster(players: list[dict]) -> None:
 def inject_css(background_url: str = "") -> None:
     dark = is_dark_mode()
     text = "#f9fafb" if dark else "#111827"
-    muted = "#d4d4d4" if dark else "#4b5563"
-    page_bg = "#101418" if dark else "#f8fafc"
-    panel = "rgba(255, 255, 255, 0.06)" if dark else "rgba(255, 255, 255, 0.84)"
-    panel_border = "rgba(255, 255, 255, 0.16)" if dark else "rgba(17, 24, 39, 0.14)"
+    muted = "#cbd5e1" if dark else "#4b5563"
+    page_bg = "#070a0f" if dark else "#f5f7fb"
+    panel = "rgba(255, 255, 255, 0.075)" if dark else "rgba(255, 255, 255, 0.9)"
+    panel_border = "rgba(255, 255, 255, 0.14)" if dark else "rgba(17, 24, 39, 0.12)"
     placeholder_bg = "#f3f4f6" if dark else "#e5e7eb"
     placeholder_text = "#737373" if dark else "#4b5563"
-    widget_bg = "#262632" if dark else "#ffffff"
+    widget_bg = "#161b24" if dark else "#ffffff"
     widget_text = "#f9fafb" if dark else "#111827"
-    widget_border = "rgba(255, 255, 255, 0.16)" if dark else "rgba(17, 24, 39, 0.20)"
-    disabled_bg = "#111827" if dark else "#eef2f7"
+    widget_border = "rgba(255, 255, 255, 0.18)" if dark else "rgba(17, 24, 39, 0.20)"
+    disabled_bg = "#0f141c" if dark else "#eef2f7"
     disabled_text = "#9ca3af" if dark else "#111827"
     overlay = (
         "linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9))"
@@ -1606,9 +2130,9 @@ def inject_css(background_url: str = "") -> None:
         <style>
         {background_css}
         .block-container {{
-            padding-top: 1.2rem;
+            padding-top: 1rem;
             padding-bottom: 2.5rem;
-            max-width: 1120px;
+            max-width: 1180px;
         }}
         #MainMenu,
         footer,
@@ -1623,7 +2147,14 @@ def inject_css(background_url: str = "") -> None:
         }}
         .stApp, .stMarkdown, p, label, h1, h2, h3 {{
             color: {text} !important;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
             letter-spacing: 0;
+        }}
+        h1 {{
+            font-weight: 950 !important;
+        }}
+        h2, h3 {{
+            font-weight: 900 !important;
         }}
         div[data-testid="stTabs"] button p {{
             color: {text} !important;
@@ -1631,6 +2162,14 @@ def inject_css(background_url: str = "") -> None:
         div[data-testid="stTabs"] button[aria-selected="true"] p {{
             color: {text} !important;
             font-weight: 900;
+        }}
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+            gap: 0.25rem;
+        }}
+        div[data-testid="stTabs"] button {{
+            border-radius: 999px 999px 0 0;
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
         }}
         div[data-baseweb="input"] input,
         div[data-baseweb="base-input"],
@@ -1665,24 +2204,24 @@ def inject_css(background_url: str = "") -> None:
             color: {text} !important;
         }}
         .player-strip-label {{
-            color: {muted};
-            font-size: 0.8rem;
-            font-weight: 800;
-            letter-spacing: 0.06em;
-            padding-top: 0.7rem;
+            color: #713f12;
+            font-size: 0.72rem;
+            font-weight: 950;
+            padding-top: 0.15rem;
             text-align: center;
             text-transform: uppercase;
         }}
         .carousel-player-name {{
-            font-size: 1rem;
+            font-size: 0.92rem;
             font-weight: 950;
             line-height: 1.1;
-            margin: 0.35rem 0 0.2rem;
+            margin: 0.28rem 0 0;
             overflow-wrap: anywhere;
             text-align: center;
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.72);
         }}
         .carousel-player-badge {{
-            color: {muted};
+            color: #334155;
             font-size: 0.75rem;
             font-weight: 800;
             line-height: 1.1;
@@ -1694,6 +2233,7 @@ def inject_css(background_url: str = "") -> None:
             display: block;
             margin: 0 auto;
             object-fit: cover;
+            outline: 2px solid rgba(255, 255, 255, 0.72);
         }}
         .carousel-avatar-placeholder,
         .photo-placeholder {{
@@ -1715,37 +2255,73 @@ def inject_css(background_url: str = "") -> None:
         }}
         .st-key-game_night_player_picker,
         .st-key-player_page_player_picker {{
-            margin: 0.5rem 0 1rem;
+            margin: 0.75rem 0 1.25rem;
+            overflow: visible;
+            padding-bottom: 0.35rem;
+        }}
+        .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"],
+        .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] {{
+            align-items: center;
+            flex-wrap: nowrap !important;
+            gap: 0.75rem;
+        }}
+        .st-key-game_night_player_bus,
+        .st-key-player_page_player_bus {{
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0) 32%),
+                linear-gradient(90deg, #f59e0b, #facc15 22%, #fbbf24 78%, #f59e0b);
+            border: 3px solid #111827;
+            border-bottom-width: 8px;
+            border-radius: 8px 8px 14px 14px;
+            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.34);
             overflow-x: auto;
             overflow-y: hidden;
-            padding-bottom: 0.35rem;
+            padding: 0.25rem 0.7rem 0.75rem;
+            position: relative;
             scrollbar-width: thin;
         }}
-        .st-key-game_night_player_picker div[data-testid="stHorizontalBlock"],
-        .st-key-player_page_player_picker div[data-testid="stHorizontalBlock"] {{
-            align-items: start;
+        .st-key-game_night_player_bus::before,
+        .st-key-game_night_player_bus::after,
+        .st-key-player_page_player_bus::before,
+        .st-key-player_page_player_bus::after {{
+            background: #111827;
+            border-radius: 999px;
+            bottom: 0.12rem;
+            content: "";
+            height: 1.15rem;
+            position: absolute;
+            width: 1.15rem;
+        }}
+        .st-key-game_night_player_bus::before,
+        .st-key-player_page_player_bus::before {{
+            left: 1.2rem;
+        }}
+        .st-key-game_night_player_bus::after,
+        .st-key-player_page_player_bus::after {{
+            right: 1.2rem;
+        }}
+        .st-key-game_night_player_bus div[data-testid="stHorizontalBlock"],
+        .st-key-player_page_player_bus div[data-testid="stHorizontalBlock"] {{
+            align-items: stretch;
             flex-wrap: nowrap !important;
-            gap: 0.65rem;
+            gap: 0.55rem;
             min-width: max-content;
         }}
-        .st-key-game_night_player_picker div[data-testid="stColumn"],
-        .st-key-player_page_player_picker div[data-testid="stColumn"] {{
-            flex: 0 0 6.9rem !important;
-            min-width: 6.9rem !important;
-            width: 6.9rem !important;
-        }}
-        .st-key-game_night_player_picker div[data-testid="stColumn"]:first-child,
-        .st-key-game_night_player_picker div[data-testid="stColumn"]:last-child,
-        .st-key-player_page_player_picker div[data-testid="stColumn"]:first-child,
-        .st-key-player_page_player_picker div[data-testid="stColumn"]:last-child {{
-            flex-basis: 3.4rem !important;
-            min-width: 3.4rem !important;
-            width: 3.4rem !important;
+        .st-key-game_night_player_bus div[data-testid="stColumn"],
+        .st-key-player_page_player_bus div[data-testid="stColumn"] {{
+            flex: 0 0 7rem !important;
+            min-width: 7rem !important;
+            width: 7rem !important;
         }}
         [class*="st-key-game_night_player_tile_"],
         [class*="st-key-player_page_player_tile_"] {{
+            background: linear-gradient(180deg, #dff6ff, #bde7f7);
+            border: 2px solid #111827;
+            border-radius: 7px;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.7);
             cursor: pointer;
-            min-height: 7.4rem;
+            min-height: 7.1rem;
+            padding: 0.45rem 0.35rem 0.35rem;
             position: relative;
         }}
         [class*="st-key-game_night_player_tile_"] .carousel-avatar,
@@ -1760,9 +2336,9 @@ def inject_css(background_url: str = "") -> None:
             left: 50%;
             overflow: visible;
             position: absolute;
-            top: 0;
+            top: 0.25rem;
             transform: translateX(-50%);
-            width: 92px;
+            width: 64px;
             z-index: 5;
         }}
         [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button,
@@ -1773,11 +2349,11 @@ def inject_css(background_url: str = "") -> None:
             box-shadow: none !important;
             color: transparent !important;
             cursor: pointer;
-            height: 92px;
-            min-height: 92px;
+            height: 64px;
+            min-height: 64px;
             opacity: 0;
             padding: 0;
-            width: 92px;
+            width: 64px;
         }}
         [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button *,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button * {{
@@ -2001,23 +2577,28 @@ def inject_css(background_url: str = "") -> None:
                 margin-left: -0.1rem;
                 margin-right: -0.1rem;
             }}
-            .st-key-game_night_player_picker div[data-testid="stHorizontalBlock"],
-            .st-key-player_page_player_picker div[data-testid="stHorizontalBlock"] {{
+            .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"],
+            .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] {{
                 gap: 0.5rem;
             }}
-            .st-key-game_night_player_picker div[data-testid="stColumn"],
-            .st-key-player_page_player_picker div[data-testid="stColumn"] {{
-                flex-basis: 5.9rem !important;
-                min-width: 5.9rem !important;
-                width: 5.9rem !important;
+            .st-key-game_night_player_bus,
+            .st-key-player_page_player_bus {{
+                padding-left: 0.45rem;
+                padding-right: 0.45rem;
             }}
-            .st-key-game_night_player_picker div[data-testid="stColumn"]:first-child,
-            .st-key-game_night_player_picker div[data-testid="stColumn"]:last-child,
-            .st-key-player_page_player_picker div[data-testid="stColumn"]:first-child,
-            .st-key-player_page_player_picker div[data-testid="stColumn"]:last-child {{
+            .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child,
+            .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child,
+            .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child,
+            .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {{
                 flex-basis: 2.8rem !important;
                 min-width: 2.8rem !important;
                 width: 2.8rem !important;
+            }}
+            .st-key-game_night_player_bus div[data-testid="stColumn"],
+            .st-key-player_page_player_bus div[data-testid="stColumn"] {{
+                flex: 0 0 4.8rem !important;
+                min-width: 4.8rem !important;
+                width: 4.8rem !important;
             }}
             div[data-testid="stButton"] button {{
                 font-size: 0.72rem;
