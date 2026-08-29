@@ -1168,6 +1168,64 @@ def save_stat_line(game_date: date, game_number: int, player_id: int, values: di
     backup_db_to_github_if_configured()
 
 
+def move_regular_stat_line_to_fantasy(game_date: date, game_number: int, player_id: int, values: dict) -> None:
+    now = datetime.utcnow().isoformat()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO fantasy_stats (
+                game_date, game_number, player_id, result, points, field_goals_made,
+                field_goals_attempted, rebounds, assists, steals, blocks,
+                threes, three_attempts, turnovers, notes, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(game_date, game_number, player_id) DO UPDATE SET
+                result = excluded.result,
+                points = excluded.points,
+                field_goals_made = excluded.field_goals_made,
+                field_goals_attempted = excluded.field_goals_attempted,
+                rebounds = excluded.rebounds,
+                assists = excluded.assists,
+                steals = excluded.steals,
+                blocks = excluded.blocks,
+                threes = excluded.threes,
+                three_attempts = excluded.three_attempts,
+                turnovers = excluded.turnovers,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            """,
+            (
+                game_date.isoformat(),
+                game_number,
+                player_id,
+                values["result"],
+                values["points"],
+                values["field_goals_made"],
+                values["field_goals_attempted"],
+                values["rebounds"],
+                values["assists"],
+                values["steals"],
+                values["blocks"],
+                values["threes"],
+                values["three_attempts"],
+                values["turnovers"],
+                values["notes"],
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM game_stats
+            WHERE game_date = ?
+              AND game_number = ?
+              AND player_id = ?
+            """,
+            (game_date.isoformat(), game_number, player_id),
+        )
+    all_stats.clear()
+    backup_db_to_github_if_configured()
+
+
 def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[tuple[int, dict]], fantasy: bool = False) -> None:
     table_name = stats_table_name(fantasy)
     now = datetime.utcnow().isoformat()
@@ -1925,7 +1983,7 @@ def render_player_game_manager(player: dict, scoped_df: pd.DataFrame, fantasy: b
             st.rerun()
 
     if st.session_state.get(edit_key, False):
-        render_stat_form(player, selected_date, selected_game, selected_stats, fantasy=fantasy)
+        render_stat_form(player, selected_date, selected_game, selected_stats, fantasy=fantasy, allow_fantasy_move=not fantasy)
 
 
 def render_player_stats_detail(player: dict) -> None:
@@ -2201,7 +2259,14 @@ def render_player_photo_manager(player: dict, scope: str) -> None:
                     st.rerun()
 
 
-def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict, fantasy: bool = False) -> None:
+def render_stat_form(
+    player: dict,
+    game_date: date,
+    game_number: int,
+    stats: dict,
+    fantasy: bool = False,
+    allow_fantasy_move: bool = False,
+) -> None:
     result_options = ["W", "L"]
     current_result = stats.get("result", "")
     result_index = result_options.index(current_result) if current_result in result_options else 0
@@ -2217,6 +2282,15 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             st.caption("Fantasy stats are hidden from Nightly Summary and Leaderboards.")
         if current_result not in result_options and stats:
             st.warning("This saved stat line is missing W/L. Pick W or L before saving your edit.")
+        move_to_fantasy = False
+        if allow_fantasy_move and stats and not fantasy:
+            move_to_fantasy = st.checkbox(
+                "Fantasy Game",
+                key=f"move_to_fantasy_{game_date}_{game_number}_{player['id']}",
+                help="Move this saved stat line out of regular stats and into the Fantasy section.",
+            )
+            if move_to_fantasy:
+                st.caption("This stat line will be removed from Nightly Summary and Leaderboards after saving.")
         result = st.radio(
             "Team result",
             options=result_options,
@@ -2246,10 +2320,10 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
                     )
 
         stat_values["notes"] = st.text_input(
-            "Fantasy blurb" if fantasy else "Notes",
+            "Fantasy blurb" if fantasy or move_to_fantasy else "Notes",
             value=stats.get("notes", ""),
             key=f"notes_{mode_key}_{game_date}_{game_number}_{player['id']}",
-            placeholder="Optional fantasy comment" if fantasy else "Optional",
+            placeholder="Optional fantasy comment" if fantasy or move_to_fantasy else "Optional",
         )
         submitted = st.button(
             "Save Fantasy Game" if fantasy else "Save Game",
@@ -2264,11 +2338,17 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             for error in validation_errors:
                 st.error(error)
             return
-        save_stat_line(game_date, game_number, player["id"], stat_values, fantasy=fantasy)
+        if move_to_fantasy:
+            move_regular_stat_line_to_fantasy(game_date, game_number, player["id"], stat_values)
+        else:
+            save_stat_line(game_date, game_number, player["id"], stat_values, fantasy=fantasy)
         all_stats.clear()
         st.session_state[f"editing_{mode_key}_{game_date}_{game_number}_{player['id']}"] = False
         st.session_state[f"pending_game_{mode_key}_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"], fantasy=fantasy)
-        st.success(f"Saved {player['name']} {'Fantasy ' if fantasy else ''}Game {game_number}.")
+        if move_to_fantasy:
+            st.success(f"Moved {player['name']} Game {game_number} to Fantasy games.")
+        else:
+            st.success(f"Saved {player['name']} {'Fantasy ' if fantasy else ''}Game {game_number}.")
         st.rerun()
 
 
