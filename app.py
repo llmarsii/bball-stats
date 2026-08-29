@@ -1279,11 +1279,27 @@ def format_stats_dataframe(
     return formatted, column_config
 
 
-def render_stats_dataframe(display: pd.DataFrame, **kwargs) -> None:
-    formatted, column_config = format_stats_dataframe(display)
-    table = formatted
+def render_stats_dataframe(
+    display: pd.DataFrame,
+    percent_columns: set[str] | None = None,
+    average_columns: set[str] | None = None,
+    **kwargs,
+) -> None:
+    formatted, column_config = format_stats_dataframe(display, percent_columns, average_columns)
+    percent_labels = percent_columns or PERCENT_COLUMNS
+    average_labels = average_columns or AVERAGE_COLUMNS
     if not is_dark_mode():
-        table = formatted.style.set_properties(
+        light_display = formatted.copy()
+        for column in light_display.columns:
+            if column in percent_labels:
+                light_display[column] = pd.to_numeric(light_display[column], errors="coerce").map(
+                    lambda value: "" if pd.isna(value) else f"{value:.1f}%"
+                )
+            elif column in average_labels:
+                light_display[column] = pd.to_numeric(light_display[column], errors="coerce").map(
+                    lambda value: "" if pd.isna(value) else f"{value:.1f}"
+                )
+        styler = light_display.style.set_properties(
             **{
                 "background-color": "#ffffff",
                 "color": "#0f172a",
@@ -1309,7 +1325,11 @@ def render_stats_dataframe(display: pd.DataFrame, **kwargs) -> None:
                 },
             ]
         )
-    st.dataframe(table, column_config=column_config, **kwargs)
+        if kwargs.get("hide_index", False):
+            styler = styler.hide(axis="index")
+        st.table(styler)
+        return
+    st.dataframe(formatted, column_config=column_config, **kwargs)
 
 
 def display_stat_lines(df: pd.DataFrame) -> pd.DataFrame:
@@ -2528,11 +2548,12 @@ def render_leaderboard() -> None:
         ["Player" if column == "name" else column for column in display_columns] + custom_columns
     ].copy()
 
-    formatted, column_config = format_stats_dataframe(
+    render_stats_dataframe(
         display,
         average_columns=AVERAGE_COLUMNS | set(custom_columns),
+        use_container_width=True,
+        hide_index=True,
     )
-    st.dataframe(formatted, column_config=column_config, use_container_width=True, hide_index=True)
 
     with st.expander("All saved stat lines"):
         display_df = display_stat_lines(filtered)
