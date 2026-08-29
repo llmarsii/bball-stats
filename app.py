@@ -120,7 +120,9 @@ BACKGROUND_KEYS = {
     "neutral": "Neutral background",
     "winning": "Winning-night background",
     "losing": "Losing-night background",
+    "secret": "Secret page background",
 }
+SECRET_PASSWORD = "2324"
 MAX_BACKGROUND_IMAGE_BYTES = 5 * 1024 * 1024
 PLAYER_COLORS = [
     "#ef4444",
@@ -393,10 +395,17 @@ def upload_db_to_github() -> bool:
         "content": base64.b64encode(DB_PATH.read_bytes()).decode("ascii"),
         "branch": config["branch"],
     }
-    sha = github_content_sha()
-    if sha:
-        payload["sha"] = sha
-    github_api_request("PUT", f"/contents/{encoded_path}", payload)
+    for attempt in range(2):
+        sha = github_content_sha()
+        if sha:
+            payload["sha"] = sha
+        try:
+            github_api_request("PUT", f"/contents/{encoded_path}", payload)
+            break
+        except RuntimeError as exc:
+            if attempt == 0 and "HTTP 409" in str(exc):
+                continue
+            raise
     return True
 
 
@@ -480,10 +489,12 @@ def table_columns(conn, table_name: str) -> dict:
     }
 
 
-def create_game_stats_table(conn: sqlite3.Connection) -> None:
+def create_stats_table(conn: sqlite3.Connection, table_name: str) -> None:
+    if table_name not in {"game_stats", "fantasy_stats"}:
+        raise ValueError("Unsupported stats table")
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS game_stats (
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
             game_date TEXT NOT NULL,
             game_number INTEGER NOT NULL DEFAULT 1,
             player_id INTEGER NOT NULL REFERENCES players(id),
@@ -560,6 +571,14 @@ def create_game_nights_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def create_game_stats_table(conn: sqlite3.Connection) -> None:
+    create_stats_table(conn, "game_stats")
+
+
+def create_fantasy_stats_table(conn: sqlite3.Connection) -> None:
+    create_stats_table(conn, "fantasy_stats")
+
+
 def create_custom_stats_table(conn: sqlite3.Connection) -> None:
     id_type = "SERIAL PRIMARY KEY" if using_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
     conn.execute(
@@ -633,8 +652,22 @@ def dedupe_background_images(conn) -> int:
     return len(duplicate_ids)
 
 
-def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
-    columns = table_columns(conn, "game_stats")
+def ensure_players_schema(conn) -> None:
+    blob_type = "BYTEA" if using_postgres() else "BLOB"
+    columns = table_columns(conn, "players")
+    migrations = {
+        "fantasy_photo_blob": blob_type,
+        "fantasy_photo_mime": "TEXT",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE players ADD COLUMN {column} {definition}")
+
+
+def ensure_stats_schema(conn: sqlite3.Connection, table_name: str) -> None:
+    if table_name not in {"game_stats", "fantasy_stats"}:
+        raise ValueError("Unsupported stats table")
+    columns = table_columns(conn, table_name)
     migrations = {
         "field_goals_made": "INTEGER NOT NULL DEFAULT 0",
         "field_goals_attempted": "INTEGER NOT NULL DEFAULT 0",
@@ -642,18 +675,19 @@ def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
     }
     for column, definition in migrations.items():
         if column not in columns:
-            conn.execute(f"ALTER TABLE game_stats ADD COLUMN {column} {definition}")
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
 
-    columns = table_columns(conn, "game_stats")
+    columns = table_columns(conn, table_name)
     if "game_number" in columns:
         return
 
     now = datetime.utcnow().isoformat()
-    conn.execute("ALTER TABLE game_stats RENAME TO game_stats_old")
-    create_game_stats_table(conn)
+    old_table = f"{table_name}_old"
+    conn.execute(f"ALTER TABLE {table_name} RENAME TO {old_table}")
+    create_stats_table(conn, table_name)
     conn.execute(
-        """
-        INSERT INTO game_stats (
+        f"""
+        INSERT INTO {table_name} (
             game_date, game_number, player_id, result, points, field_goals_made,
             field_goals_attempted, rebounds, assists, steals, blocks, threes,
             three_attempts, turnovers, notes, updated_at
@@ -675,11 +709,15 @@ def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
             turnovers,
             notes,
             COALESCE(updated_at, ?)
-        FROM game_stats_old
+        FROM {old_table}
         """,
         (now,),
     )
-    conn.execute("DROP TABLE game_stats_old")
+    conn.execute(f"DROP TABLE {old_table}")
+
+
+def ensure_game_stats_schema(conn: sqlite3.Connection) -> None:
+    ensure_stats_schema(conn, "game_stats")
 
 
 def init_db() -> None:
@@ -701,13 +739,16 @@ def init_db() -> None:
             """
         )
         create_game_stats_table(conn)
+        create_fantasy_stats_table(conn)
         create_app_assets_table(conn)
         create_background_images_table(conn)
         create_game_nights_table(conn)
         create_custom_stats_table(conn)
+        ensure_players_schema(conn)
         migrate_legacy_background_assets(conn)
         duplicate_background_count = dedupe_background_images(conn)
         ensure_game_stats_schema(conn)
+        ensure_stats_schema(conn, "fantasy_stats")
         player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
         if player_count == 0:
             now = datetime.utcnow().isoformat()
@@ -727,7 +768,7 @@ def get_players() -> list[dict]:
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT id, name, sort_order, photo_blob, photo_mime
+            SELECT id, name, sort_order, photo_blob, photo_mime, fantasy_photo_blob, fantasy_photo_mime
             FROM players
             ORDER BY sort_order, id
             """
@@ -770,6 +811,34 @@ def remove_player_photo(player_id: int) -> None:
             """
             UPDATE players
             SET photo_blob = NULL, photo_mime = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (datetime.utcnow().isoformat(), player_id),
+        )
+    get_players.clear()
+    backup_db_to_github_if_configured()
+
+
+def update_player_fantasy_photo(player_id: int, image_bytes: bytes, mime_type: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE players
+            SET fantasy_photo_blob = ?, fantasy_photo_mime = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (image_bytes, mime_type, datetime.utcnow().isoformat(), player_id),
+        )
+    get_players.clear()
+    backup_db_to_github_if_configured()
+
+
+def remove_player_fantasy_photo(player_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE players
+            SET fantasy_photo_blob = NULL, fantasy_photo_mime = NULL, updated_at = ?
             WHERE id = ?
             """,
             (datetime.utcnow().isoformat(), player_id),
@@ -930,9 +999,9 @@ def deterministic_background_choice(assets: list[dict], asset_key: str, game_dat
     return assets[int(digest, 16) % len(assets)]
 
 
-def selected_background_asset(asset_key: str, game_date: date) -> dict | None:
+def selected_background_asset(asset_key: str, game_date: date, fallback_to_neutral: bool = True) -> dict | None:
     assets = get_background_assets(asset_key)
-    if not assets and asset_key != "neutral":
+    if not assets and fallback_to_neutral and asset_key != "neutral":
         assets = get_background_assets("neutral")
         asset_key = "neutral"
     if not assets:
@@ -972,17 +1041,22 @@ def selected_background_asset(asset_key: str, game_date: date) -> dict | None:
     return chosen
 
 
-def background_data_url(asset_key: str, game_date: date) -> str:
-    asset = selected_background_asset(asset_key, game_date)
+def background_data_url(asset_key: str, game_date: date, fallback_to_neutral: bool = True) -> str:
+    asset = selected_background_asset(asset_key, game_date, fallback_to_neutral=fallback_to_neutral)
     return asset_to_data_url(asset) if asset else ""
 
 
-def stats_for_date(game_date: date) -> list[dict]:
+def stats_table_name(fantasy: bool = False) -> str:
+    return "fantasy_stats" if fantasy else "game_stats"
+
+
+def stats_for_date(game_date: date, fantasy: bool = False) -> list[dict]:
+    table_name = stats_table_name(fantasy)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
-            FROM game_stats
+            FROM {table_name}
             WHERE game_date = ?
             ORDER BY game_number, player_id
             """,
@@ -991,25 +1065,25 @@ def stats_for_date(game_date: date) -> list[dict]:
     return [normalize_row(row) for row in rows]
 
 
-def stats_by_game(game_date: date, player_id: int) -> dict[int, dict]:
+def stats_by_game(game_date: date, player_id: int, fantasy: bool = False) -> dict[int, dict]:
     return {
         row["game_number"]: row
-        for row in stats_for_date(game_date)
+        for row in stats_for_date(game_date, fantasy=fantasy)
         if row["player_id"] == player_id
     }
 
 
-def stats_for_game(game_date: date, game_number: int) -> dict[int, dict]:
+def stats_for_game(game_date: date, game_number: int, fantasy: bool = False) -> dict[int, dict]:
     return {
         row["player_id"]: row
-        for row in stats_for_date(game_date)
+        for row in stats_for_date(game_date, fantasy=fantasy)
         if row["game_number"] == game_number
     }
 
 
-def game_counts_for_date(game_date: date) -> dict[int, str]:
+def game_counts_for_date(game_date: date, fantasy: bool = False) -> dict[int, str]:
     counts: dict[int, int] = {}
-    for row in stats_for_date(game_date):
+    for row in stats_for_date(game_date, fantasy=fantasy):
         counts[row["player_id"]] = counts.get(row["player_id"], 0) + 1
     return {
         player_id: f"{count} game" if count == 1 else f"{count} games"
@@ -1017,13 +1091,13 @@ def game_counts_for_date(game_date: date) -> dict[int, str]:
     }
 
 
-def next_game_number(game_date: date, player_id: int) -> int:
-    player_games = stats_by_game(game_date, player_id)
+def next_game_number(game_date: date, player_id: int, fantasy: bool = False) -> int:
+    player_games = stats_by_game(game_date, player_id, fantasy=fantasy)
     return max(player_games.keys(), default=0) + 1
 
 
-def next_group_game_number(game_date: date) -> int:
-    game_numbers = [row["game_number"] for row in stats_for_date(game_date)]
+def next_group_game_number(game_date: date, fantasy: bool = False) -> int:
+    game_numbers = [row["game_number"] for row in stats_for_date(game_date, fantasy=fantasy)]
     return max(game_numbers, default=0) + 1
 
 
@@ -1045,12 +1119,13 @@ def default_stat_values(stats: dict | None = None) -> dict:
     }
 
 
-def save_stat_line(game_date: date, game_number: int, player_id: int, values: dict) -> None:
+def save_stat_line(game_date: date, game_number: int, player_id: int, values: dict, fantasy: bool = False) -> None:
+    table_name = stats_table_name(fantasy)
     now = datetime.utcnow().isoformat()
     with db() as conn:
         conn.execute(
-            """
-            INSERT INTO game_stats (
+            f"""
+            INSERT INTO {table_name} (
                 game_date, game_number, player_id, result, points, field_goals_made,
                 field_goals_attempted, rebounds, assists, steals, blocks,
                 threes, three_attempts, turnovers, notes, updated_at
@@ -1093,7 +1168,8 @@ def save_stat_line(game_date: date, game_number: int, player_id: int, values: di
     backup_db_to_github_if_configured()
 
 
-def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[tuple[int, dict]]) -> None:
+def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[tuple[int, dict]], fantasy: bool = False) -> None:
+    table_name = stats_table_name(fantasy)
     now = datetime.utcnow().isoformat()
     params = [
         (
@@ -1120,8 +1196,8 @@ def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[
         return
     with db() as conn:
         conn.executemany(
-            """
-            INSERT INTO game_stats (
+            f"""
+            INSERT INTO {table_name} (
                 game_date, game_number, player_id, result, points, field_goals_made,
                 field_goals_attempted, rebounds, assists, steals, blocks,
                 threes, three_attempts, turnovers, notes, updated_at
@@ -1147,11 +1223,12 @@ def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[
     backup_db_to_github_if_configured()
 
 
-def delete_stat_line(game_date: date, game_number: int, player_id: int) -> None:
+def delete_stat_line(game_date: date, game_number: int, player_id: int, fantasy: bool = False) -> None:
+    table_name = stats_table_name(fantasy)
     with db() as conn:
         conn.execute(
-            """
-            DELETE FROM game_stats
+            f"""
+            DELETE FROM {table_name}
             WHERE game_date = ?
               AND game_number = ?
               AND player_id = ?
@@ -1162,11 +1239,44 @@ def delete_stat_line(game_date: date, game_number: int, player_id: int) -> None:
     backup_db_to_github_if_configured()
 
 
+def delete_game_stats(game_date: date, game_number: int, fantasy: bool = False) -> None:
+    table_name = stats_table_name(fantasy)
+    with db() as conn:
+        conn.execute(
+            f"""
+            DELETE FROM {table_name}
+            WHERE game_date = ?
+              AND game_number = ?
+            """,
+            (game_date.isoformat(), game_number),
+        )
+    all_stats.clear()
+    backup_db_to_github_if_configured()
+
+
+def update_stat_notes(game_date: date, game_number: int, player_id: int, notes: str, fantasy: bool = False) -> None:
+    table_name = stats_table_name(fantasy)
+    with db() as conn:
+        conn.execute(
+            f"""
+            UPDATE {table_name}
+            SET notes = ?, updated_at = ?
+            WHERE game_date = ?
+              AND game_number = ?
+              AND player_id = ?
+            """,
+            (notes.strip(), datetime.utcnow().isoformat(), game_date.isoformat(), game_number, player_id),
+        )
+    all_stats.clear()
+    backup_db_to_github_if_configured()
+
+
 @st.cache_data(ttl=2)
-def all_stats() -> pd.DataFrame:
+def all_stats(fantasy: bool = False) -> pd.DataFrame:
+    table_name = stats_table_name(fantasy)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 gs.game_date,
                 gs.game_number,
@@ -1185,7 +1295,7 @@ def all_stats() -> pd.DataFrame:
                 gs.turnovers,
                 gs.notes,
                 gs.updated_at
-            FROM game_stats gs
+            FROM {table_name} gs
             JOIN players p ON p.id = gs.player_id
             ORDER BY gs.game_date DESC, gs.game_number DESC, p.sort_order, p.id
             """
@@ -1253,6 +1363,42 @@ def saved_game_dates(df: pd.DataFrame | None = None) -> list[date]:
         return []
     dates = {parsed for parsed in (parse_game_date(value) for value in stats_df["game_date"]) if parsed}
     return sorted(dates, reverse=True)
+
+
+def saved_game_groups(include_fantasy: bool = True) -> list[dict]:
+    groups = []
+    for fantasy in ([False, True] if include_fantasy else [False]):
+        df = all_stats(fantasy=fantasy)
+        if df.empty:
+            continue
+        grouped = (
+            df.groupby(["game_date", "game_number"], as_index=False)
+            .agg(stat_lines=("player_id", "count"), points=("points", "sum"))
+            .sort_values(["game_date", "game_number"], ascending=[False, False])
+        )
+        for _, row in grouped.iterrows():
+            game_date = parse_game_date(row["game_date"])
+            if game_date is None:
+                continue
+            groups.append(
+                {
+                    "game_date": game_date,
+                    "game_number": int(row["game_number"]),
+                    "stat_lines": int(row["stat_lines"]),
+                    "points": int(row["points"]),
+                    "fantasy": fantasy,
+                }
+            )
+    return sorted(groups, key=lambda item: (item["game_date"], item["game_number"], item["fantasy"]), reverse=True)
+
+
+def game_group_label(group: dict) -> str:
+    stat_word = "line" if group["stat_lines"] == 1 else "lines"
+    mode_label = "Fantasy" if group["fantasy"] else "Regular"
+    return (
+        f"{format_date_with_weekday(group['game_date'])} - Game {group['game_number']} "
+        f"- {mode_label} - {group['stat_lines']} {stat_word}, {group['points']} PTS"
+    )
 
 
 def formatted_metric_average(value: float) -> str:
@@ -1499,11 +1645,13 @@ def player_initials(name: str) -> str:
     return "".join(part[0].upper() for part in parts[:2])
 
 
-def player_photo_data_url(player: dict) -> str:
-    if not player.get("photo_blob"):
+def player_photo_data_url(player: dict, fantasy: bool = False) -> str:
+    blob_key = "fantasy_photo_blob" if fantasy else "photo_blob"
+    mime_key = "fantasy_photo_mime" if fantasy else "photo_mime"
+    if not player.get(blob_key):
         return ""
-    mime_type = player.get("photo_mime") or "image/png"
-    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
+    mime_type = player.get(mime_key) or "image/png"
+    encoded = base64.b64encode(player[blob_key]).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
 
 
@@ -1514,8 +1662,11 @@ def render_bus_wheels() -> None:
     )
 
 
-def render_clickable_photo_control(player: dict, scope: str, size: int = 112) -> None:
-    photo_url = player_photo_data_url(player)
+def render_clickable_photo_control(player: dict, scope: str, size: int = 112, fantasy: bool = False) -> None:
+    photo_url = player_photo_data_url(player, fantasy=fantasy)
+    blob_key = "fantasy_photo_blob" if fantasy else "photo_blob"
+    update_photo = update_player_fantasy_photo if fantasy else update_player_photo
+    remove_photo = remove_player_fantasy_photo if fantasy else remove_player_photo
     if photo_url:
         visual = (
             f'<img class="profile-photo-click-target" src="{photo_url}" '
@@ -1537,16 +1688,16 @@ def render_clickable_photo_control(player: dict, scope: str, size: int = 112) ->
         )
         st.caption("Click to add / change photo")
         if uploaded is not None:
-            update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+            update_photo(player["id"], uploaded.getvalue(), uploaded.type)
             st.success("Profile photo saved.")
             st.rerun()
-        if player.get("photo_blob"):
+        if player.get(blob_key):
             if st.button(
                 "Remove",
                 key=f"{scope}_remove_photo_{player['id']}",
                 use_container_width=True,
             ):
-                remove_player_photo(player["id"])
+                remove_photo(player["id"])
                 st.success("Profile photo removed.")
                 st.rerun()
 
@@ -1917,31 +2068,34 @@ def render_player_photo_manager(player: dict, scope: str) -> None:
                     st.rerun()
 
 
-def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict) -> None:
+def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict, fantasy: bool = False) -> None:
     result_options = ["", "W", "L"]
     current_result = stats.get("result", "")
     result_index = result_options.index(current_result) if current_result in result_options else 0
+    mode_key = "fantasy" if fantasy else "regular"
 
-    with st.form(f"stat_form_{game_date}_{game_number}_{player['id']}"):
+    with st.form(f"stat_form_{mode_key}_{game_date}_{game_number}_{player['id']}"):
         st.markdown(f"### {player['name']} - Game {game_number}")
         st.caption(format_game_date(game_date))
+        if fantasy:
+            st.caption("Fantasy stats are hidden from Nightly Summary and Leaderboards.")
         result = st.radio(
             "Team result",
             options=result_options,
             index=result_index,
             horizontal=True,
             format_func=lambda option: "Unset" if option == "" else option,
-            key=f"result_{game_date}_{game_number}_{player['id']}",
+            key=f"result_{mode_key}_{game_date}_{game_number}_{player['id']}",
         )
 
         stat_values = {"result": result}
-        with st.container(key=f"stat_entry_fields_{game_date}_{game_number}_{player['id']}"):
+        with st.container(key=f"stat_entry_fields_{mode_key}_{game_date}_{game_number}_{player['id']}"):
             first_row = st.columns(5)
             for index, field in enumerate(["points", "field_goals_made", "field_goals_attempted", "threes", "three_attempts"]):
                 with first_row[index]:
                     stat_values[field] = stat_input(
                         STAT_FIELDS[field],
-                        f"{field}_{game_date}_{game_number}_{player['id']}",
+                        f"{field}_{mode_key}_{game_date}_{game_number}_{player['id']}",
                         stats.get(field, 0),
                     )
 
@@ -1950,18 +2104,18 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
                 with second_row[index]:
                     stat_values[field] = stat_input(
                         STAT_FIELDS[field],
-                        f"{field}_{game_date}_{game_number}_{player['id']}",
+                        f"{field}_{mode_key}_{game_date}_{game_number}_{player['id']}",
                         stats.get(field, 0),
                     )
 
         stat_values["notes"] = st.text_input(
-            "Notes",
+            "Fantasy blurb" if fantasy else "Notes",
             value=stats.get("notes", ""),
-            key=f"notes_{game_date}_{game_number}_{player['id']}",
-            placeholder="Optional",
+            key=f"notes_{mode_key}_{game_date}_{game_number}_{player['id']}",
+            placeholder="Optional fantasy comment" if fantasy else "Optional",
         )
         submitted = st.form_submit_button(
-            "Save Game",
+            "Save Fantasy Game" if fantasy else "Save Game",
             type="primary",
             use_container_width=True,
     )
@@ -1972,16 +2126,19 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             for error in validation_errors:
                 st.error(error)
             return
-        save_stat_line(game_date, game_number, player["id"], stat_values)
+        save_stat_line(game_date, game_number, player["id"], stat_values, fantasy=fantasy)
         all_stats.clear()
-        st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = False
-        st.session_state[f"pending_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
-        st.success(f"Saved {player['name']} Game {game_number}.")
+        st.session_state[f"editing_{mode_key}_{game_date}_{game_number}_{player['id']}"] = False
+        st.session_state[f"pending_game_{mode_key}_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"], fantasy=fantasy)
+        st.success(f"Saved {player['name']} {'Fantasy ' if fantasy else ''}Game {game_number}.")
         st.rerun()
 
 
-def render_saved_stat_line(player: dict, game_date: date, game_number: int, stats: dict) -> None:
+def render_saved_stat_line(player: dict, game_date: date, game_number: int, stats: dict, fantasy: bool = False) -> None:
+    mode_key = "fantasy" if fantasy else "regular"
     st.markdown(f"### {player['name']} - Game {game_number}")
+    if fantasy:
+        st.caption("Fantasy stats are hidden from Nightly Summary and Leaderboards.")
     metric_cols = st.columns(5)
     metric_cols[0].metric("PTS", stats.get("points", 0))
     metric_cols[1].metric(
@@ -2004,24 +2161,24 @@ def render_saved_stat_line(player: dict, game_date: date, game_number: int, stat
 
     action_cols = st.columns(2)
     with action_cols[0]:
-        if st.button("Edit Game Stats", key=f"edit_{game_date}_{game_number}_{player['id']}", type="primary", use_container_width=True):
-            st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = True
+        if st.button("Edit Game Stats", key=f"edit_{mode_key}_{game_date}_{game_number}_{player['id']}", type="primary", use_container_width=True):
+            st.session_state[f"editing_{mode_key}_{game_date}_{game_number}_{player['id']}"] = True
             st.rerun()
     with action_cols[1]:
-        confirm_key = f"confirm_delete_{game_date}_{game_number}_{player['id']}"
+        confirm_key = f"confirm_delete_{mode_key}_{game_date}_{game_number}_{player['id']}"
         confirmed = st.checkbox(
             f"Confirm delete Game {game_number}",
             key=confirm_key,
         )
         if st.button(
             "Delete Game Stats",
-            key=f"delete_{game_date}_{game_number}_{player['id']}",
+            key=f"delete_{mode_key}_{game_date}_{game_number}_{player['id']}",
             disabled=not confirmed,
             use_container_width=True,
         ):
-            delete_stat_line(game_date, game_number, player["id"])
+            delete_stat_line(game_date, game_number, player["id"], fantasy=fantasy)
             st.session_state.pop(confirm_key, None)
-            st.session_state[f"pending_game_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"])
+            st.session_state[f"pending_game_{mode_key}_{game_date}_{player['id']}"] = next_game_number(game_date, player["id"], fantasy=fantasy)
             st.success(f"Deleted {player['name']} Game {game_number}.")
             st.rerun()
 
@@ -2072,13 +2229,14 @@ def render_game_location(game_date: date) -> None:
                 st.rerun()
 
 
-def render_bulk_game_form(players: list[dict], game_date: date) -> None:
-    date_rows = stats_for_date(game_date)
+def render_bulk_game_form(players: list[dict], game_date: date, fantasy: bool = False) -> None:
+    mode_key = "fantasy" if fantasy else "regular"
+    date_rows = stats_for_date(game_date, fantasy=fantasy)
     existing_games = sorted({row["game_number"] for row in date_rows})
-    next_game = next_group_game_number(game_date)
+    next_game = next_group_game_number(game_date, fantasy=fantasy)
     game_options = existing_games + ([] if next_game in existing_games else [next_game])
-    game_key = f"bulk_game_{game_date}"
-    pending_game_key = f"bulk_pending_game_{game_date}"
+    game_key = f"bulk_game_{mode_key}_{game_date}"
+    pending_game_key = f"bulk_pending_game_{mode_key}_{game_date}"
     if st.session_state.get(pending_game_key) in game_options:
         st.session_state[game_key] = st.session_state.pop(pending_game_key)
     if st.session_state.get(game_key) not in game_options:
@@ -2091,9 +2249,9 @@ def render_bulk_game_form(players: list[dict], game_date: date) -> None:
         format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
     )
 
-    existing_game_stats = stats_for_game(game_date, selected_game)
+    existing_game_stats = stats_for_game(game_date, selected_game, fantasy=fantasy)
     player_names = {player["id"]: player["name"] for player in players}
-    selection_key = f"bulk_players_{game_date}_{selected_game}"
+    selection_key = f"bulk_players_{mode_key}_{game_date}_{selected_game}"
     if selection_key not in st.session_state:
         existing_player_ids = [
             player["id"]
@@ -2113,7 +2271,7 @@ def render_bulk_game_form(players: list[dict], game_date: date) -> None:
         return
 
     player_values = []
-    with st.container(key=f"bulk_game_stepper_table_{game_date}_{selected_game}"):
+    with st.container(key=f"bulk_game_stepper_table_{mode_key}_{game_date}_{selected_game}"):
         header_cols = st.columns([1.35, 0.9, *([1.35] * len(BULK_STAT_COLUMNS)), 1.45])
         header_cols[0].markdown("**Player**")
         header_cols[1].markdown("**W/L**")
@@ -2134,17 +2292,17 @@ def render_bulk_game_form(players: list[dict], game_date: date) -> None:
                     options=result_options,
                     index=result_options.index(current_result),
                     format_func=lambda option: "-" if option == "" else option,
-                    key=f"bulk_result_{game_date}_{selected_game}_{player_id}",
+                    key=f"bulk_result_{mode_key}_{game_date}_{selected_game}_{player_id}",
                     label_visibility="collapsed",
                 )
 
             stat_values = {"result": result}
             for col, (label, field) in zip(row_cols[2:-1], BULK_STAT_COLUMNS):
                 with col:
-                    value_key = f"bulk_{field}_{game_date}_{selected_game}_{player_id}"
+                    value_key = f"bulk_{field}_{mode_key}_{game_date}_{selected_game}_{player_id}"
                     if value_key not in st.session_state:
                         st.session_state[value_key] = values[field]
-                    with st.container(key=f"bulk_stepper_{field}_{game_date}_{selected_game}_{player_id}"):
+                    with st.container(key=f"bulk_stepper_{field}_{mode_key}_{game_date}_{selected_game}_{player_id}"):
                         step_cols = st.columns([0.95, 1.05, 0.95])
                         with step_cols[0]:
                             st.button(
@@ -2172,16 +2330,23 @@ def render_bulk_game_form(players: list[dict], game_date: date) -> None:
 
             with row_cols[-1]:
                 stat_values["notes"] = st.text_input(
-                    "Notes",
+                    "Fantasy blurb" if fantasy else "Notes",
                     value=values["notes"],
-                    key=f"bulk_notes_{game_date}_{selected_game}_{player_id}",
+                    key=f"bulk_notes_{mode_key}_{game_date}_{selected_game}_{player_id}",
                     label_visibility="collapsed",
-                    placeholder="Optional",
+                    placeholder="Optional fantasy comment" if fantasy else "Optional",
                 )
             player_values.append((player_id, stat_values))
 
     st.caption("Save Game updates selected players only. Deselecting a player does not delete any existing stat line.")
-    submitted = st.button("Save Game Table", type="primary", use_container_width=True)
+    if fantasy:
+        st.caption("Fantasy stats save to the Secret tab only and do not count in Nightly Summary or Leaderboards.")
+    submitted = st.button(
+        "Save Fantasy Game Table" if fantasy else "Save Game Table",
+        type="primary",
+        use_container_width=True,
+        key=f"save_bulk_{mode_key}_{game_date}_{selected_game}",
+    )
 
     if not submitted:
         return
@@ -2198,18 +2363,58 @@ def render_bulk_game_form(players: list[dict], game_date: date) -> None:
         return
 
     was_new_game = selected_game == next_game
-    save_stat_lines_bulk(game_date, selected_game, player_values)
+    save_stat_lines_bulk(game_date, selected_game, player_values, fantasy=fantasy)
     all_stats.clear()
     if was_new_game:
-        st.session_state[pending_game_key] = next_group_game_number(game_date)
-    st.success(f"Saved Game {selected_game} for {len(player_values)} players.")
+        st.session_state[pending_game_key] = next_group_game_number(game_date, fantasy=fantasy)
+    st.success(f"Saved {'Fantasy ' if fantasy else ''}Game {selected_game} for {len(player_values)} players.")
     st.rerun()
+
+
+def render_delete_game_panel() -> None:
+    groups = saved_game_groups(include_fantasy=True)
+    with st.expander("Delete a saved game"):
+        st.caption("Deletes every player stat line for the selected game. This does not delete players or photos.")
+        if not groups:
+            st.info("No saved games to delete yet.")
+            return
+
+        labels = [game_group_label(group) for group in groups]
+        selected_label = st.selectbox(
+            "Game to delete",
+            options=labels,
+            key="delete_game_group",
+        )
+        selected_group = groups[labels.index(selected_label)]
+        st.warning(
+            f"This will delete {selected_group['stat_lines']} "
+            f"{'fantasy' if selected_group['fantasy'] else 'regular'} stat lines."
+        )
+        confirm_text = st.text_input(
+            "Type DELETE to confirm",
+            key="delete_game_confirm_text",
+            placeholder="DELETE",
+        )
+        if st.button(
+            "Delete Selected Game Stats",
+            key="delete_selected_game_stats",
+            disabled=confirm_text.strip().upper() != "DELETE",
+            use_container_width=True,
+        ):
+            delete_game_stats(
+                selected_group["game_date"],
+                selected_group["game_number"],
+                fantasy=selected_group["fantasy"],
+            )
+            st.success("Selected game stats deleted.")
+            st.rerun()
 
 
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
     game_date = st.date_input("Playing date", value=app_today(), key="playing_date")
     st.info("To upload or change a player photo, go to the Roster tab or Player Page tab.")
+    render_delete_game_panel()
     entry_mode = st.segmented_control(
         "Entry mode",
         options=["Full game table", "One player"],
@@ -2218,23 +2423,31 @@ def render_game_night(players: list[dict]) -> None:
         width="stretch",
     )
     entry_mode = entry_mode or "Full game table"
+    fantasy_mode = st.toggle(
+        "Fantasy stats",
+        key="game_night_fantasy_mode",
+        help="Fantasy stats are saved to the Secret tab and do not count in Nightly Summary or Leaderboards.",
+    )
+    if fantasy_mode:
+        st.info("Fantasy stats are hidden from Nightly Summary and Leaderboards. Open Secret with password 2324 to see them.")
 
     if entry_mode == "Full game table":
         st.caption("Select the players in the game, enter everyone on one table, then save the game.")
-        render_bulk_game_form(players, game_date)
+        render_bulk_game_form(players, game_date, fantasy=fantasy_mode)
         return
 
-    player_badges = game_counts_for_date(game_date)
+    player_badges = game_counts_for_date(game_date, fantasy=fantasy_mode)
     current_player_id = selected_player_id(players)
     st.caption("Select a player, then enter one game at a time. The next game opens automatically after saving.")
     render_player_picker(players, current_player_id, player_badges, scope="game_night")
 
     current_player = next(player for player in players if player["id"] == current_player_id)
-    player_games = stats_by_game(game_date, current_player_id)
+    player_games = stats_by_game(game_date, current_player_id, fantasy=fantasy_mode)
     next_game = max(player_games.keys(), default=0) + 1
     game_options = sorted(player_games.keys()) + [next_game]
-    game_key = f"selected_game_{game_date}_{current_player_id}"
-    pending_game_key = f"pending_game_{game_date}_{current_player_id}"
+    mode_key = "fantasy" if fantasy_mode else "regular"
+    game_key = f"selected_game_{mode_key}_{game_date}_{current_player_id}"
+    pending_game_key = f"pending_game_{mode_key}_{game_date}_{current_player_id}"
     if st.session_state.get(pending_game_key) in game_options:
         st.session_state[game_key] = st.session_state.pop(pending_game_key)
     if st.session_state.get(game_key) not in game_options:
@@ -2249,12 +2462,12 @@ def render_game_night(players: list[dict]) -> None:
             format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
         )
         current_stats = player_games.get(selected_game, {})
-        edit_key = f"editing_{game_date}_{selected_game}_{current_player_id}"
+        edit_key = f"editing_{mode_key}_{game_date}_{selected_game}_{current_player_id}"
 
         if current_stats and not st.session_state.get(edit_key, False):
-            render_saved_stat_line(current_player, game_date, selected_game, current_stats)
+            render_saved_stat_line(current_player, game_date, selected_game, current_stats, fantasy=fantasy_mode)
         else:
-            render_stat_form(current_player, game_date, selected_game, current_stats)
+            render_stat_form(current_player, game_date, selected_game, current_stats, fantasy=fantasy_mode)
 
 
 def render_nightly_summary() -> None:
@@ -2566,6 +2779,137 @@ def render_leaderboard() -> None:
         )
 
 
+def render_secret_background_uploader() -> None:
+    uploaded = st.file_uploader(
+        "Secret background picture",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="secret_background_upload",
+    )
+    if uploaded is None:
+        return
+    image_bytes = uploaded.getvalue()
+    upload_fingerprint = image_fingerprint(image_bytes)
+    if len(image_bytes) > MAX_BACKGROUND_IMAGE_BYTES:
+        st.error(f"{uploaded.name} is too large. Keep each image under {MAX_BACKGROUND_IMAGE_BYTES // (1024 * 1024)} MB.")
+        return
+    if st.session_state.get("last_secret_background_upload") == upload_fingerprint:
+        return
+    added = add_background_asset("secret", image_bytes, uploaded.type)
+    st.session_state.last_secret_background_upload = upload_fingerprint
+    st.success("Secret background saved." if added else "That Secret background is already saved.")
+    st.rerun()
+
+
+def fantasy_summary_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    summary = aggregate_player_totals(df, ["player_id", "name"])
+    summary["PPG"] = (summary["points"] / summary["games"]).round(1)
+    summary["RPG"] = (summary["rebounds"] / summary["games"]).round(1)
+    summary["APG"] = (summary["assists"] / summary["games"]).round(1)
+    columns = [
+        "name",
+        "games",
+        "points",
+        "PPG",
+        "rebounds",
+        "RPG",
+        "assists",
+        "APG",
+        "steals",
+        "blocks",
+        "turnovers",
+        "fg_pct",
+        "three_pct",
+    ]
+    return summary[columns].rename(
+        columns={
+            "name": "Player",
+            "games": "Fantasy Games",
+            "points": "PTS",
+            "rebounds": "REB",
+            "assists": "AST",
+            "steals": "STL",
+            "blocks": "BLK",
+            "turnovers": "TO",
+            "fg_pct": "FG%",
+            "three_pct": "3P%",
+        }
+    )
+
+
+def render_fantasy_blurb_editor(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    st.markdown("#### Fantasy blurbs")
+    rows = df.sort_values(["game_date", "game_number", "name"], ascending=[False, False, True])
+    for _, row in rows.iterrows():
+        game_date = parse_game_date(row["game_date"])
+        if game_date is None:
+            continue
+        key_base = f"fantasy_blurb_{row['game_date']}_{int(row['game_number'])}_{int(row['player_id'])}"
+        with st.container(border=True, key=f"{key_base}_card"):
+            st.caption(f"{row['name']} - {format_date_with_weekday(game_date)} - Game {int(row['game_number'])}")
+            blurb = st.text_area(
+                "Comment",
+                value=row.get("notes", "") or "",
+                key=key_base,
+                height=80,
+                placeholder="Add the fantasy storyline for this stat line.",
+            )
+            if st.button("Save blurb", key=f"{key_base}_save"):
+                update_stat_notes(game_date, int(row["game_number"]), int(row["player_id"]), blurb, fantasy=True)
+                st.success("Fantasy blurb saved.")
+                st.rerun()
+
+
+def render_secret_page(players: list[dict]) -> None:
+    st.subheader("Secret")
+    password = st.text_input("Password", type="password", key="secret_password")
+    if password != SECRET_PASSWORD:
+        if password:
+            st.error("Wrong password.")
+        return
+
+    fantasy_df = all_stats(fantasy=True)
+    with st.container(key="secret_page_shell"):
+        st.markdown("### Fantasy Room")
+        render_secret_background_uploader()
+
+        if fantasy_df.empty:
+            st.info("No fantasy stat lines saved yet. Turn on Fantasy stats on Game Night, then save a fantasy game.")
+            return
+
+        summary = fantasy_summary_display(fantasy_df)
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Fantasy lines", len(fantasy_df))
+        metric_cols[1].metric("Fantasy nights", fantasy_df["game_date"].nunique())
+        metric_cols[2].metric("Fantasy points", int(fantasy_df["points"].sum()))
+        metric_cols[3].metric("Secret photos", sum(1 for player in players if player.get("fantasy_photo_blob")))
+
+        st.markdown("#### Secret player cards")
+        for row_start in range(0, len(players), 4):
+            cols = st.columns(4)
+            for col, player in zip(cols, players[row_start:row_start + 4]):
+                player_rows = fantasy_df[fantasy_df["player_id"] == player["id"]]
+                with col:
+                    with st.container(border=True, key=f"secret_player_card_{player['id']}"):
+                        st.markdown(f"**{player['name']}**")
+                        render_clickable_photo_control(player, "secret", size=104, fantasy=True)
+                        if player_rows.empty:
+                            st.caption("No fantasy lines yet.")
+                        else:
+                            st.metric("Fantasy PTS", int(player_rows["points"].sum()))
+
+        st.markdown("#### Fantasy summary")
+        render_stats_dataframe(summary, use_container_width=True, hide_index=True)
+
+        with st.expander("Fantasy stat lines and blurbs", expanded=True):
+            game_display = display_stat_lines(fantasy_df)
+            render_stats_dataframe(game_display, use_container_width=True, hide_index=True)
+            render_fantasy_blurb_editor(fantasy_df)
+
+
 def render_roster(players: list[dict]) -> None:
     st.subheader("Roster")
     st.caption("Rename the seven player slots and manage profile photos.")
@@ -2587,7 +2931,7 @@ def render_roster(players: list[dict]) -> None:
                         st.rerun()
 
 
-def inject_css(background_url: str = "") -> None:
+def inject_css(background_url: str = "", secret_background_url: str = "") -> None:
     dark = is_dark_mode()
     text = "#f9fafb" if dark else "#111827"
     muted = "#cbd5e1" if dark else "#475569"
@@ -2627,6 +2971,12 @@ def inject_css(background_url: str = "") -> None:
             color: {text};
         }}
         """
+    secret_shell_background = (
+        f'linear-gradient(rgba(2, 6, 23, 0.68), rgba(2, 6, 23, 0.82)), url("{secret_background_url}")'
+        if secret_background_url
+        else "linear-gradient(135deg, rgba(88, 28, 135, 0.30), rgba(14, 165, 233, 0.18)), "
+        "linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.80))"
+    )
 
     st.markdown(
         f"""
@@ -3023,7 +3373,8 @@ def inject_css(background_url: str = "") -> None:
             width: 112px;
         }}
         [class*="st-key-player_page_photo_click_"],
-        [class*="st-key-roster_photo_click_"] {{
+        [class*="st-key-roster_photo_click_"],
+        [class*="st-key-secret_photo_click_"] {{
             margin: 0 auto;
             max-width: 9rem;
             position: relative;
@@ -3051,11 +3402,13 @@ def inject_css(background_url: str = "") -> None:
             border-style: solid;
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stCaptionContainer"],
-        [class*="st-key-roster_photo_click_"] div[data-testid="stCaptionContainer"] {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stCaptionContainer"],
+        [class*="st-key-secret_photo_click_"] div[data-testid="stCaptionContainer"] {{
             pointer-events: none;
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"],
-        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"] {{
             display: block;
             left: 0 !important;
             margin: 0;
@@ -3068,11 +3421,13 @@ def inject_css(background_url: str = "") -> None:
         [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"] {{
             transform: translateY(-132px);
         }}
-        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"] {{
             transform: translateY(-104px);
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"] label,
-        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] label {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] label,
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"] label {{
             display: none;
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"],
@@ -3084,20 +3439,25 @@ def inject_css(background_url: str = "") -> None:
         }}
         [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"],
         [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
-        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button,
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
+        [class*="st-key-secret_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
             height: 104px;
             min-height: 104px;
             width: 104px;
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stCaptionContainer"] p,
-        [class*="st-key-roster_photo_click_"] div[data-testid="stCaptionContainer"] p {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stCaptionContainer"] p,
+        [class*="st-key-secret_photo_click_"] div[data-testid="stCaptionContainer"] p {{
             color: {muted} !important;
             font-size: 0.74rem;
             line-height: 1.15;
             margin-top: 0.35rem;
         }}
         [class*="st-key-player_page_photo_click_"] div[data-testid="stButton"] button,
-        [class*="st-key-roster_photo_click_"] div[data-testid="stButton"] button {{
+        [class*="st-key-roster_photo_click_"] div[data-testid="stButton"] button,
+        [class*="st-key-secret_photo_click_"] div[data-testid="stButton"] button {{
             border-radius: 999px;
             font-size: 0.72rem;
             min-height: 1.85rem;
@@ -3107,6 +3467,14 @@ def inject_css(background_url: str = "") -> None:
             background:
                 linear-gradient(135deg, rgba(34, 197, 94, 0.12), rgba(14, 165, 233, 0.08)),
                 {panel};
+        }}
+        [class*="st-key-secret_page_shell"] {{
+            background: {secret_shell_background};
+            background-position: center;
+            background-size: cover;
+            border: 1px solid {panel_border};
+            border-radius: 16px;
+            padding: 1rem;
         }}
         [class*="st-key-roster_card_"] {{
             background:
@@ -3382,7 +3750,10 @@ def main() -> None:
     init_db()
     background_date = active_background_date()
     background_key = night_background_key(background_date)
-    inject_css(background_data_url(background_key, background_date))
+    inject_css(
+        background_data_url(background_key, background_date),
+        background_data_url("secret", app_today(), fallback_to_neutral=False),
+    )
 
     players = get_players()
     header_cols = st.columns([5, 1])
@@ -3393,8 +3764,8 @@ def main() -> None:
         render_theme_toggle()
     render_storage_warning()
 
-    tab_game, tab_player, tab_summary, tab_leaderboard, tab_backgrounds, tab_roster = st.tabs(
-        ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Backgrounds", "Roster"]
+    tab_game, tab_player, tab_summary, tab_leaderboard, tab_secret, tab_backgrounds, tab_roster = st.tabs(
+        ["Game Night", "Player Page", "Nightly Summary", "Leaderboards", "Secret", "Backgrounds", "Roster"]
     )
     with tab_game:
         render_game_night(players)
@@ -3404,6 +3775,8 @@ def main() -> None:
         render_nightly_summary()
     with tab_leaderboard:
         render_leaderboard()
+    with tab_secret:
+        render_secret_page(players)
     with tab_backgrounds:
         render_backgrounds()
     with tab_roster:
