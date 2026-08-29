@@ -61,6 +61,18 @@ STAT_FIELDS = {
     "three_attempts": "3PA",
     "turnovers": "TO",
 }
+BULK_STAT_COLUMNS = [
+    ("PTS", "points"),
+    ("FGM", "field_goals_made"),
+    ("FGA", "field_goals_attempted"),
+    ("3PM", "threes"),
+    ("3PA", "three_attempts"),
+    ("REB", "rebounds"),
+    ("AST", "assists"),
+    ("STL", "steals"),
+    ("BLK", "blocks"),
+    ("TO", "turnovers"),
+]
 SUMMARY_COLUMNS = {
     "name": "Player",
     "result": "W/L",
@@ -88,13 +100,12 @@ NIGHTLY_TOTAL_COLUMNS = {
     "wins": "W",
     "losses": "L",
     "record": "W-L",
+    "win_pct": "WIN%",
     "points": "PTS",
     "field_goals_made": "FGM",
     "field_goals_attempted": "FGA",
-    "fg_pct": "FG%",
     "threes": "3PM",
     "three_attempts": "3PA",
-    "three_pct": "3P%",
     "rebounds": "REB",
     "assists": "AST",
     "steals": "STL",
@@ -123,6 +134,44 @@ PLAYER_COLORS = [
 PERCENT_COLUMNS = {"FG%", "3P%", "WIN%"}
 AVERAGE_COLUMNS = {"PPG", "RPG", "APG", "SPG", "BPG", "TPG", "FGM/G", "FGA/G", "3PM/G", "3PA/G"}
 WEEKDAY_ABBREVIATIONS = ["M", "Tu", "W", "Th", "F", "Sa", "Su"]
+TOTAL_LEADERBOARD_COLUMNS = [
+    "name",
+    "GP",
+    "Nights",
+    "W",
+    "L",
+    "PTS",
+    "FGM",
+    "FGA",
+    "REB",
+    "AST",
+    "STL",
+    "BLK",
+    "THREE_PM",
+    "THREE_PA",
+    "TO",
+    "WIN%",
+]
+AVERAGE_LEADERBOARD_COLUMNS = [
+    "name",
+    "GP",
+    "Nights",
+    "W",
+    "L",
+    "WIN%",
+    "PPG",
+    "FG%",
+    "3P%",
+    "RPG",
+    "APG",
+    "SPG",
+    "BPG",
+    "TPG",
+    "FGM/G",
+    "FGA/G",
+    "3PM/G",
+    "3PA/G",
+]
 CUSTOM_STAT_FIELDS = [
     "GP",
     "Nights",
@@ -950,6 +999,14 @@ def stats_by_game(game_date: date, player_id: int) -> dict[int, dict]:
     }
 
 
+def stats_for_game(game_date: date, game_number: int) -> dict[int, dict]:
+    return {
+        row["player_id"]: row
+        for row in stats_for_date(game_date)
+        if row["game_number"] == game_number
+    }
+
+
 def game_counts_for_date(game_date: date) -> dict[int, str]:
     counts: dict[int, int] = {}
     for row in stats_for_date(game_date):
@@ -963,6 +1020,29 @@ def game_counts_for_date(game_date: date) -> dict[int, str]:
 def next_game_number(game_date: date, player_id: int) -> int:
     player_games = stats_by_game(game_date, player_id)
     return max(player_games.keys(), default=0) + 1
+
+
+def next_group_game_number(game_date: date) -> int:
+    game_numbers = [row["game_number"] for row in stats_for_date(game_date)]
+    return max(game_numbers, default=0) + 1
+
+
+def default_stat_values(stats: dict | None = None) -> dict:
+    stats = stats or {}
+    return {
+        "result": stats.get("result", ""),
+        "points": int(stats.get("points", 0) or 0),
+        "field_goals_made": int(stats.get("field_goals_made", 0) or 0),
+        "field_goals_attempted": int(stats.get("field_goals_attempted", 0) or 0),
+        "rebounds": int(stats.get("rebounds", 0) or 0),
+        "assists": int(stats.get("assists", 0) or 0),
+        "steals": int(stats.get("steals", 0) or 0),
+        "blocks": int(stats.get("blocks", 0) or 0),
+        "threes": int(stats.get("threes", 0) or 0),
+        "three_attempts": int(stats.get("three_attempts", 0) or 0),
+        "turnovers": int(stats.get("turnovers", 0) or 0),
+        "notes": stats.get("notes", "") or "",
+    }
 
 
 def save_stat_line(game_date: date, game_number: int, player_id: int, values: dict) -> None:
@@ -1009,6 +1089,60 @@ def save_stat_line(game_date: date, game_number: int, player_id: int, values: di
                 values["notes"],
                 now,
             ),
+        )
+    backup_db_to_github_if_configured()
+
+
+def save_stat_lines_bulk(game_date: date, game_number: int, player_values: list[tuple[int, dict]]) -> None:
+    now = datetime.utcnow().isoformat()
+    params = [
+        (
+            game_date.isoformat(),
+            game_number,
+            player_id,
+            values["result"],
+            values["points"],
+            values["field_goals_made"],
+            values["field_goals_attempted"],
+            values["rebounds"],
+            values["assists"],
+            values["steals"],
+            values["blocks"],
+            values["threes"],
+            values["three_attempts"],
+            values["turnovers"],
+            values["notes"],
+            now,
+        )
+        for player_id, values in player_values
+    ]
+    if not params:
+        return
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO game_stats (
+                game_date, game_number, player_id, result, points, field_goals_made,
+                field_goals_attempted, rebounds, assists, steals, blocks,
+                threes, three_attempts, turnovers, notes, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(game_date, game_number, player_id) DO UPDATE SET
+                result = excluded.result,
+                points = excluded.points,
+                field_goals_made = excluded.field_goals_made,
+                field_goals_attempted = excluded.field_goals_attempted,
+                rebounds = excluded.rebounds,
+                assists = excluded.assists,
+                steals = excluded.steals,
+                blocks = excluded.blocks,
+                threes = excluded.threes,
+                three_attempts = excluded.three_attempts,
+                turnovers = excluded.turnovers,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            """,
+            params,
         )
     backup_db_to_github_if_configured()
 
@@ -1072,8 +1206,28 @@ def stat_input(label: str, key: str, value: int) -> int:
     )
 
 
+def stat_line_validation_errors(values: dict, player_name: str = "") -> list[str]:
+    prefix = f"{player_name}: " if player_name else ""
+    errors = []
+    if values["field_goals_made"] > values["field_goals_attempted"]:
+        errors.append(f"{prefix}FGM cannot be greater than FGA.")
+    if values["threes"] > values["three_attempts"]:
+        errors.append(f"{prefix}3PM cannot be greater than 3PA.")
+    if values["threes"] > values["field_goals_made"]:
+        errors.append(f"{prefix}3PM cannot be greater than FGM.")
+    return errors
+
+
 def format_game_date(game_date: date) -> str:
     return f"{game_date:%b} {game_date.day}, {game_date:%Y}"
+
+
+def safe_shooting_pct(made: int | float, attempted: int | float) -> float:
+    attempts = int(attempted or 0)
+    if attempts <= 0:
+        return 0.0
+    makes = max(0, min(int(made or 0), attempts))
+    return round(makes / attempts, 3)
 
 
 def format_date_with_weekday(game_date: date) -> str:
@@ -1122,6 +1276,16 @@ def format_stats_dataframe(
 def render_stats_dataframe(display: pd.DataFrame, **kwargs) -> None:
     formatted, column_config = format_stats_dataframe(display)
     st.dataframe(formatted, column_config=column_config, **kwargs)
+
+
+def display_stat_lines(df: pd.DataFrame) -> pd.DataFrame:
+    display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
+    return add_percentages(df)[display_columns].rename(
+        columns={
+            "game_date": "Date",
+            **GAME_LOG_COLUMNS,
+        }
+    )
 
 
 def formula_alias(column: str) -> str:
@@ -1266,9 +1430,64 @@ def render_player_avatar(player: dict, size: int = 92) -> None:
         )
         return
     st.markdown(
-        f'<div class="carousel-avatar-placeholder" style="width:{size}px;height:{size}px;">+</div>',
+        (
+            f'<div class="carousel-avatar-placeholder" style="width:{size}px;height:{size}px;">'
+            f'{html.escape(player_initials(player["name"]))}</div>'
+        ),
         unsafe_allow_html=True,
     )
+
+
+def player_initials(name: str) -> str:
+    parts = [part for part in name.strip().split() if part]
+    if not parts:
+        return "+"
+    return "".join(part[0].upper() for part in parts[:2])
+
+
+def player_photo_data_url(player: dict) -> str:
+    if not player.get("photo_blob"):
+        return ""
+    mime_type = player.get("photo_mime") or "image/png"
+    encoded = base64.b64encode(player["photo_blob"]).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def render_clickable_photo_control(player: dict, scope: str, size: int = 112) -> None:
+    photo_url = player_photo_data_url(player)
+    if photo_url:
+        visual = (
+            f'<img class="profile-photo-click-target" src="{photo_url}" '
+            f'style="width:{size}px;height:{size}px;" alt="">'
+        )
+    else:
+        visual = (
+            f'<div class="profile-photo-click-target is-empty" style="width:{size}px;height:{size}px;">'
+            f'{html.escape(player_initials(player["name"]))}</div>'
+        )
+
+    with st.container(key=f"{scope}_photo_click_{player['id']}"):
+        st.markdown(visual, unsafe_allow_html=True)
+        uploaded = st.file_uploader(
+            f"Click to add / change photo for {player['name']}",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"{scope}_photo_upload_{player['id']}",
+            label_visibility="collapsed",
+        )
+        st.caption("Click to add / change photo")
+        if uploaded is not None:
+            update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
+            st.success("Profile photo saved.")
+            st.rerun()
+        if player.get("photo_blob"):
+            if st.button(
+                "Remove",
+                key=f"{scope}_remove_photo_{player['id']}",
+                use_container_width=True,
+            ):
+                remove_player_photo(player["id"])
+                st.success("Profile photo removed.")
+                st.rerun()
 
 
 def render_player_picker(
@@ -1290,7 +1509,6 @@ def render_player_picker(
 
         with nav_cols[1]:
             with st.container(key=f"{scope}_player_bus"):
-                st.markdown('<div class="player-strip-label">Players</div>', unsafe_allow_html=True)
                 columns = st.columns(len(players))
                 for index, player in enumerate(players):
                     color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
@@ -1298,7 +1516,7 @@ def render_player_picker(
                     badge = player_badges.get(player["id"], "")
                     with columns[index]:
                         with st.container(key=f"{scope}_player_tile_{player['id']}"):
-                            render_player_avatar(player, size=64)
+                            render_player_avatar(player, size=78)
                             st.markdown(
                                 (
                                     f'<div class="carousel-player-name" style="color:{color};">'
@@ -1326,33 +1544,79 @@ def render_player_picker(
                 st.rerun()
 
 
-def render_player_header(player: dict) -> None:
-    st.markdown(f"### {player['name']}")
-    st.caption("Night-by-night stat history. Click any column header to sort.")
-
-
 def render_player_stats_detail(player: dict) -> None:
-    render_player_header(player)
+    player_view, filtered_all = render_stats_scope_controls("player_page", all_stats())
+    scoped_df = filtered_all[filtered_all["player_id"] == player["id"]].copy() if not filtered_all.empty else filtered_all
+    completed = scoped_df[scoped_df["result"].isin(["W", "L"])].copy() if not scoped_df.empty else scoped_df
+    summary = aggregate_player_totals(completed, ["player_id", "name"]) if not completed.empty else pd.DataFrame()
 
-    history = player_history(player["id"])
+    with st.container(border=True, key=f"player_profile_summary_{player['id']}"):
+        st.markdown(f"### {player['name']}")
+        top_cols = st.columns([1.25, 4])
+        with top_cols[0]:
+            render_clickable_photo_control(player, "player_page", size=132)
+        with top_cols[1]:
+            metric_cols = st.columns(4)
+            if summary.empty:
+                for col, label in zip(metric_cols, ["Games", "Wins", "PPG", "RPG"]):
+                    col.metric(label, "0.0" if label.endswith("PG") else 0)
+            else:
+                row = summary.iloc[0]
+                total_games = int(row["games"])
+                metric_cols[0].metric("Games", total_games)
+                metric_cols[1].metric("Wins", int(row["wins"]))
+                metric_cols[2].metric("PPG", formatted_metric_average(row["points"] / total_games))
+                metric_cols[3].metric("RPG", formatted_metric_average(row["rebounds"] / total_games))
+
+    filtered = scoped_df
+    completed = filtered[filtered["result"].isin(["W", "L"])].copy() if not filtered.empty else filtered
+    history = aggregate_player_totals(completed, ["game_date", "player_id", "name"]).sort_values("game_date", ascending=False) if not completed.empty else pd.DataFrame()
+
     if history.empty:
-        st.info(f"No stat lines saved for {player['name']} yet.")
+        st.info(f"No stat lines saved for {player['name']} in this view yet.")
         return
 
-    metric_cols = st.columns(4)
-    total_games = int(history["games"].sum())
-    metric_cols[0].metric("Games", total_games)
-    metric_cols[1].metric("Wins", int(history["wins"].sum()))
-    metric_cols[2].metric("PPG", formatted_metric_average(history["points"].sum() / total_games))
-    metric_cols[3].metric("RPG", formatted_metric_average(history["rebounds"].sum() / total_games))
+    if player_view == "Per game averages":
+        display = player_average_display(history)
+    else:
+        display_columns = [
+            "game_date",
+            "games",
+            "wins",
+            "losses",
+            "record",
+            "points",
+            "field_goals_made",
+            "field_goals_attempted",
+            "rebounds",
+            "assists",
+            "steals",
+            "blocks",
+            "threes",
+            "three_attempts",
+            "turnovers",
+        ]
+        display = history[display_columns].rename(
+            columns={
+                "game_date": "Date",
+                "games": "Games",
+                "wins": "W",
+                "losses": "L",
+                "record": "W-L",
+                "points": "PTS",
+                "field_goals_made": "FGM",
+                "field_goals_attempted": "FGA",
+                "rebounds": "REB",
+                "assists": "AST",
+                "steals": "STL",
+                "blocks": "BLK",
+                "threes": "3PM",
+                "three_attempts": "3PA",
+                "turnovers": "TO",
+            }
+        )
 
-    display_columns = list(PLAYER_NIGHT_COLUMNS.keys())
-    display_columns.remove("name")
-    display = history[display_columns].rename(
-        columns={
-            **PLAYER_NIGHT_COLUMNS,
-        }
-    )
+    st.caption("Filtered player results. Click any column header to sort.")
     render_stats_dataframe(display, use_container_width=True, hide_index=True)
     st.download_button(
         "Download Player CSV",
@@ -1361,8 +1625,8 @@ def render_player_stats_detail(player: dict) -> None:
         mime="text/csv",
     )
 
-    with st.expander("Game-by-game log", expanded=True):
-        games = player_game_log(player["id"])
+    with st.expander("Game-by-game log", expanded=False):
+        games = add_percentages(filtered).sort_values(["game_date", "game_number"], ascending=[False, False])
         game_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
         game_columns.remove("name")
         game_display = games[game_columns].rename(
@@ -1379,15 +1643,11 @@ def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
     if result.empty:
         return result
     result["fg_pct"] = result.apply(
-        lambda row: round(row["field_goals_made"] / row["field_goals_attempted"], 3)
-        if row["field_goals_attempted"]
-        else None,
+        lambda row: safe_shooting_pct(row["field_goals_made"], row["field_goals_attempted"]),
         axis=1,
     )
     result["three_pct"] = result.apply(
-        lambda row: round(row["threes"] / row["three_attempts"], 3)
-        if row["three_attempts"]
-        else None,
+        lambda row: safe_shooting_pct(row["threes"], row["three_attempts"]),
         axis=1,
     )
     return result
@@ -1412,7 +1672,84 @@ def aggregate_player_totals(df: pd.DataFrame, group_cols: list[str]) -> pd.DataF
         turnovers=("turnovers", "sum"),
     )
     grouped["record"] = grouped["wins"].astype(str) + "-" + grouped["losses"].astype(str)
+    grouped["win_pct"] = (grouped["wins"] / grouped["games"]).round(3)
     return add_percentages(grouped)
+
+
+def render_stats_scope_controls(scope: str, df: pd.DataFrame) -> tuple[str, pd.DataFrame]:
+    control_cols = st.columns([1.2, 2.8])
+    with control_cols[0]:
+        view = st.selectbox(
+            "View",
+            options=["Totals", "Per game averages"],
+            key=f"{scope}_view",
+        )
+    date_labels = {format_date_with_weekday(game_date): game_date for game_date in saved_game_dates(df)}
+    night_options = ["ALL GAMES", *date_labels.keys()]
+    with control_cols[1]:
+        selected_nights = st.multiselect(
+            "Game nights",
+            options=night_options,
+            default=["ALL GAMES"],
+            key=f"{scope}_nights",
+        )
+
+    filtered = df.copy()
+    if selected_nights and "ALL GAMES" not in selected_nights:
+        selected_dates = {date_labels[label].isoformat() for label in selected_nights if label in date_labels}
+        filtered = filtered[filtered["game_date"].isin(selected_dates)]
+    return view, filtered
+
+
+def add_per_game_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    if result.empty:
+        return result
+    result["WIN%"] = (result["wins"] / result["games"]).round(3)
+    result["PPG"] = (result["points"] / result["games"]).round(1)
+    result["RPG"] = (result["rebounds"] / result["games"]).round(1)
+    result["APG"] = (result["assists"] / result["games"]).round(1)
+    result["SPG"] = (result["steals"] / result["games"]).round(1)
+    result["BPG"] = (result["blocks"] / result["games"]).round(1)
+    result["TPG"] = (result["turnovers"] / result["games"]).round(1)
+    result["FGM/G"] = (result["field_goals_made"] / result["games"]).round(1)
+    result["FGA/G"] = (result["field_goals_attempted"] / result["games"]).round(1)
+    result["3PM/G"] = (result["threes"] / result["games"]).round(1)
+    result["3PA/G"] = (result["three_attempts"] / result["games"]).round(1)
+    return result
+
+
+def player_average_display(history: pd.DataFrame) -> pd.DataFrame:
+    with_averages = add_per_game_columns(history)
+    columns = [
+        "game_date",
+        "games",
+        "wins",
+        "losses",
+        "WIN%",
+        "PPG",
+        "fg_pct",
+        "three_pct",
+        "RPG",
+        "APG",
+        "SPG",
+        "BPG",
+        "TPG",
+        "FGM/G",
+        "FGA/G",
+        "3PM/G",
+        "3PA/G",
+    ]
+    return with_averages[columns].rename(
+        columns={
+            "game_date": "Date",
+            "games": "Games",
+            "wins": "W",
+            "losses": "L",
+            "fg_pct": "FG%",
+            "three_pct": "3P%",
+        }
+    )
 
 
 def nightly_summary(game_date: date) -> pd.DataFrame:
@@ -1490,23 +1827,24 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
         )
 
         stat_values = {"result": result}
-        first_row = st.columns(5)
-        for index, field in enumerate(["points", "field_goals_made", "field_goals_attempted", "threes", "three_attempts"]):
-            with first_row[index]:
-                stat_values[field] = stat_input(
-                    STAT_FIELDS[field],
-                    f"{field}_{game_date}_{game_number}_{player['id']}",
-                    stats.get(field, 0),
-                )
+        with st.container(key=f"stat_entry_fields_{game_date}_{game_number}_{player['id']}"):
+            first_row = st.columns(5)
+            for index, field in enumerate(["points", "field_goals_made", "field_goals_attempted", "threes", "three_attempts"]):
+                with first_row[index]:
+                    stat_values[field] = stat_input(
+                        STAT_FIELDS[field],
+                        f"{field}_{game_date}_{game_number}_{player['id']}",
+                        stats.get(field, 0),
+                    )
 
-        second_row = st.columns(5)
-        for index, field in enumerate(["rebounds", "assists", "steals", "blocks", "turnovers"]):
-            with second_row[index]:
-                stat_values[field] = stat_input(
-                    STAT_FIELDS[field],
-                    f"{field}_{game_date}_{game_number}_{player['id']}",
-                    stats.get(field, 0),
-                )
+            second_row = st.columns(5)
+            for index, field in enumerate(["rebounds", "assists", "steals", "blocks", "turnovers"]):
+                with second_row[index]:
+                    stat_values[field] = stat_input(
+                        STAT_FIELDS[field],
+                        f"{field}_{game_date}_{game_number}_{player['id']}",
+                        stats.get(field, 0),
+                    )
 
         stat_values["notes"] = st.text_input(
             "Notes",
@@ -1518,9 +1856,14 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             "Save Game",
             type="primary",
             use_container_width=True,
-        )
+    )
 
     if submitted:
+        validation_errors = stat_line_validation_errors(stat_values)
+        if validation_errors:
+            for error in validation_errors:
+                st.error(error)
+            return
         save_stat_line(game_date, game_number, player["id"], stat_values)
         all_stats.clear()
         st.session_state[f"editing_{game_date}_{game_number}_{player['id']}"] = False
@@ -1621,14 +1964,139 @@ def render_game_location(game_date: date) -> None:
                 st.rerun()
 
 
+def render_bulk_game_form(players: list[dict], game_date: date) -> None:
+    date_rows = stats_for_date(game_date)
+    existing_games = sorted({row["game_number"] for row in date_rows})
+    next_game = next_group_game_number(game_date)
+    game_options = existing_games + ([] if next_game in existing_games else [next_game])
+    game_key = f"bulk_game_{game_date}"
+    pending_game_key = f"bulk_pending_game_{game_date}"
+    if st.session_state.get(pending_game_key) in game_options:
+        st.session_state[game_key] = st.session_state.pop(pending_game_key)
+    if st.session_state.get(game_key) not in game_options:
+        st.session_state[game_key] = next_game
+
+    selected_game = st.selectbox(
+        "Game",
+        options=game_options,
+        key=game_key,
+        format_func=lambda value: f"Game {value}" + (" (next)" if value == next_game else ""),
+    )
+
+    existing_game_stats = stats_for_game(game_date, selected_game)
+    player_options = [player["id"] for player in players]
+    player_names = {player["id"]: player["name"] for player in players}
+    default_player_ids = list(existing_game_stats.keys()) if existing_game_stats else player_options
+    selected_player_ids = st.multiselect(
+        "Players in this game",
+        options=player_options,
+        default=default_player_ids,
+        key=f"bulk_players_{game_date}_{selected_game}",
+        format_func=lambda player_id: player_names[player_id],
+    )
+
+    if not selected_player_ids:
+        st.info("Select at least one player to enter game stats.")
+        return
+
+    table_rows = []
+    for player_id in selected_player_ids:
+        values = default_stat_values(existing_game_stats.get(player_id))
+        row = {
+            "_player_id": player_id,
+            "Player": player_names[player_id],
+            "W/L": values["result"],
+            "Notes": values["notes"],
+        }
+        for label, field in BULK_STAT_COLUMNS:
+            row[label] = values[field]
+        table_rows.append(row)
+
+    entry_df = pd.DataFrame(table_rows)
+    with st.form(f"bulk_stat_form_{game_date}_{selected_game}"):
+        with st.container(key=f"bulk_game_table_{game_date}_{selected_game}"):
+            edited_df = st.data_editor(
+                entry_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=["Player"],
+                column_order=["Player", "W/L", *[label for label, _ in BULK_STAT_COLUMNS], "Notes"],
+                column_config={
+                    "_player_id": None,
+                    "Player": st.column_config.TextColumn("Player", width="medium"),
+                    "W/L": st.column_config.SelectboxColumn("W/L", options=["", "W", "L"], width="small"),
+                    **{
+                        label: st.column_config.NumberColumn(
+                            label,
+                            min_value=0,
+                            max_value=200,
+                            step=1,
+                            format="%d",
+                            width="small",
+                        )
+                        for label, _ in BULK_STAT_COLUMNS
+                    },
+                    "Notes": st.column_config.TextColumn("Notes", width="medium"),
+                },
+                key=f"bulk_editor_{game_date}_{selected_game}",
+            )
+        st.caption("Save Game updates selected players only. Deselecting a player does not delete any existing stat line.")
+        submitted = st.form_submit_button("Save Game Table", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    player_values = []
+    validation_errors = []
+    for row_index, (_, row) in enumerate(edited_df.iterrows()):
+        player_id = selected_player_ids[row_index]
+        values = {
+            "result": "" if pd.isna(row["W/L"]) else str(row["W/L"]),
+            "notes": "" if pd.isna(row["Notes"]) else str(row["Notes"]),
+        }
+        for label, field in BULK_STAT_COLUMNS:
+            value = pd.to_numeric(row[label], errors="coerce")
+            values[field] = int(value) if pd.notna(value) else 0
+
+        if values["result"] not in ["", "W", "L"]:
+            validation_errors.append(f"{player_names[player_id]}: W/L must be W, L, or blank.")
+        validation_errors.extend(stat_line_validation_errors(values, player_names[player_id]))
+        player_values.append((player_id, values))
+
+    if validation_errors:
+        for error in validation_errors:
+            st.error(error)
+        return
+
+    was_new_game = selected_game == next_game
+    save_stat_lines_bulk(game_date, selected_game, player_values)
+    all_stats.clear()
+    if was_new_game:
+        st.session_state[pending_game_key] = next_group_game_number(game_date)
+    st.success(f"Saved Game {selected_game} for {len(player_values)} players.")
+    st.rerun()
+
+
 def render_game_night(players: list[dict]) -> None:
     st.subheader("Game Night")
     game_date = st.date_input("Playing date", value=app_today(), key="playing_date")
-    render_game_location(game_date)
+    st.info("To upload or change a player photo, go to the Roster tab or Player Page tab.")
+    entry_mode = st.radio(
+        "Entry mode",
+        options=["Full game table", "One player"],
+        horizontal=True,
+        key="game_night_entry_mode",
+    )
+
+    if entry_mode == "Full game table":
+        st.caption("Select the players in the game, enter everyone on one table, then save the game.")
+        render_bulk_game_form(players, game_date)
+        return
+
     player_badges = game_counts_for_date(game_date)
     current_player_id = selected_player_id(players)
     st.caption("Select a player, then enter one game at a time. The next game opens automatically after saving.")
-    st.info("To upload or change a player photo, go to the Roster tab or Player Page tab.")
     render_player_picker(players, current_player_id, player_badges, scope="game_night")
 
     current_player = next(player for player in players if player["id"] == current_player_id)
@@ -1746,7 +2214,6 @@ def render_player_page(players: list[dict]) -> None:
     current_player_id = selected_player_id(players)
     current_player = next(player for player in players if player["id"] == current_player_id)
     render_player_picker(players, current_player_id, {}, scope="player_page")
-    render_player_photo_manager(current_player, "player_page")
     render_player_stats_detail(current_player)
 
 
@@ -1892,40 +2359,14 @@ def render_leaderboard() -> None:
     metric_cols[2].metric("Total points", int(df["points"].sum()))
     metric_cols[3].metric("Photos", sum(1 for player in get_players() if player.get("photo_blob")))
 
-    control_cols = st.columns([1.2, 2.8])
-    with control_cols[0]:
-        leaderboard_view = st.selectbox(
-            "Leaderboard view",
-            options=["Totals", "Per game averages"],
-            key="leaderboard_view",
-        )
-    date_labels = {format_date_with_weekday(game_date): game_date for game_date in saved_game_dates(df)}
-    night_options = ["ALL GAMES", *date_labels.keys()]
-    with control_cols[1]:
-        selected_nights = st.multiselect(
-            "Game nights",
-            options=night_options,
-            default=["ALL GAMES"],
-            key="leaderboard_nights",
-        )
-
-    filtered = df.copy()
-    if selected_nights and "ALL GAMES" not in selected_nights:
-        selected_dates = {date_labels[label].isoformat() for label in selected_nights if label in date_labels}
-        filtered = filtered[filtered["game_date"].isin(selected_dates)]
+    leaderboard_view, filtered = render_stats_scope_controls("leaderboard", df)
 
     custom_stats = render_custom_stat_builder()
 
     completed = filtered[filtered["result"].isin(["W", "L"])].copy()
     if completed.empty:
         st.info("Saved rows need W/L results before standings can be calculated.")
-        display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
-        display_df = add_percentages(filtered)[display_columns].rename(
-            columns={
-                "game_date": "Date",
-                **GAME_LOG_COLUMNS,
-            }
-        )
+        display_df = display_stat_lines(filtered)
         render_stats_dataframe(display_df, use_container_width=True, hide_index=True)
         return
 
@@ -1947,8 +2388,8 @@ def render_leaderboard() -> None:
     )
     grouped["WIN%"] = (grouped["W"] / grouped["GP"]).round(3)
     grouped["PPG"] = (grouped["PTS"] / grouped["GP"]).round(1)
-    grouped["FG%"] = grouped.apply(lambda row: round(row["FGM"] / row["FGA"], 3) if row["FGA"] else None, axis=1)
-    grouped["3P%"] = grouped.apply(lambda row: round(row["THREE_PM"] / row["THREE_PA"], 3) if row["THREE_PA"] else None, axis=1)
+    grouped["FG%"] = grouped.apply(lambda row: safe_shooting_pct(row["FGM"], row["FGA"]), axis=1)
+    grouped["3P%"] = grouped.apply(lambda row: safe_shooting_pct(row["THREE_PM"], row["THREE_PA"]), axis=1)
     grouped["RPG"] = (grouped["REB"] / grouped["GP"]).round(1)
     grouped["APG"] = (grouped["AST"] / grouped["GP"]).round(1)
     grouped = grouped.sort_values(["W", "WIN%", "PPG"], ascending=False)
@@ -1961,55 +2402,17 @@ def render_leaderboard() -> None:
         grouped["SPG"] = (grouped["STL"] / grouped["GP"]).round(1)
         grouped["BPG"] = (grouped["BLK"] / grouped["GP"]).round(1)
         grouped["TPG"] = (grouped["TO"] / grouped["GP"]).round(1)
-        display_columns = [
-            "name",
-            "GP",
-            "Nights",
-            "W",
-            "L",
-            "WIN%",
-            "PPG",
-            "FG%",
-            "3P%",
-            "RPG",
-            "APG",
-            "SPG",
-            "BPG",
-            "TPG",
-            "FGM/G",
-            "FGA/G",
-            "3PM/G",
-            "3PA/G",
-        ]
+        display_columns = AVERAGE_LEADERBOARD_COLUMNS
     else:
-        display_columns = [
-            "name",
-            "GP",
-            "Nights",
-            "W",
-            "L",
-            "PTS",
-            "FGM",
-            "FGA",
-            "REB",
-            "AST",
-            "STL",
-            "BLK",
-            "THREE_PM",
-            "THREE_PA",
-            "TO",
-            "WIN%",
-            "PPG",
-            "FG%",
-            "3P%",
-            "RPG",
-            "APG",
-        ]
+        display_columns = TOTAL_LEADERBOARD_COLUMNS
 
-    display = grouped[display_columns].copy()
-    display, custom_columns, custom_errors = add_custom_stat_columns(display, custom_stats)
+    formula_base = grouped.rename(columns={"name": "Player"}).copy()
+    formula_base, custom_columns, custom_errors = add_custom_stat_columns(formula_base, custom_stats)
     for error in custom_errors:
         st.warning(f"Custom stat skipped: {error}")
+    display = formula_base[
+        ["Player" if column == "name" else column for column in display_columns] + custom_columns
+    ].copy()
 
     formatted, column_config = format_stats_dataframe(
         display,
@@ -2018,13 +2421,7 @@ def render_leaderboard() -> None:
     st.dataframe(formatted, column_config=column_config, use_container_width=True, hide_index=True)
 
     with st.expander("All saved stat lines"):
-        display_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
-        display_df = add_percentages(filtered)[display_columns].rename(
-            columns={
-                "game_date": "Date",
-                **GAME_LOG_COLUMNS,
-            }
-        )
+        display_df = display_stat_lines(filtered)
         render_stats_dataframe(display_df, use_container_width=True, hide_index=True)
         st.download_button(
             "Download CSV",
@@ -2038,67 +2435,35 @@ def render_roster(players: list[dict]) -> None:
     st.subheader("Roster")
     st.caption("Rename the seven player slots and manage profile photos.")
 
-    for player in players:
-        with st.container(border=True, key=f"roster_row_{player['id']}"):
-            cols = st.columns([1, 4, 2])
-            with cols[0]:
-                if player.get("photo_blob"):
-                    render_photo(player, size=84)
-                else:
-                    with st.container(key=f"roster_photo_tile_{player['id']}"):
-                        uploaded = st.file_uploader(
-                            f"Add photo for {player['name']}",
-                            type=["png", "jpg", "jpeg", "webp"],
-                            key=f"roster_photo_{player['id']}",
-                            label_visibility="collapsed",
-                        )
-                    if uploaded is not None:
-                        update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
-                        st.success("Photo saved.")
+    for row_start in range(0, len(players), 3):
+        cols = st.columns(3)
+        for col, player in zip(cols, players[row_start:row_start + 3]):
+            with col:
+                with st.container(border=True, key=f"roster_card_{player['id']}"):
+                    render_clickable_photo_control(player, "roster", size=104)
+                    new_name = st.text_input(
+                        "Player name",
+                        value=player["name"],
+                        key=f"name_{player['id']}",
+                    )
+                    if st.button("Save name", key=f"rename_{player['id']}", use_container_width=True):
+                        update_player_name(player["id"], new_name)
+                        st.success("Name saved.")
                         st.rerun()
-            with cols[1]:
-                new_name = st.text_input(
-                    "Player name",
-                    value=player["name"],
-                    key=f"name_{player['id']}",
-                )
-                if st.button("Save name", key=f"rename_{player['id']}"):
-                    update_player_name(player["id"], new_name)
-                    st.success("Name saved.")
-                    st.rerun()
-            with cols[2]:
-                if player.get("photo_blob"):
-                    with st.container(key=f"roster_photo_actions_{player['id']}"):
-                        with st.container(key=f"roster_change_photo_{player['id']}"):
-                            uploaded = st.file_uploader(
-                                f"Change photo for {player['name']}",
-                                type=["png", "jpg", "jpeg", "webp"],
-                                key=f"roster_photo_{player['id']}",
-                                label_visibility="collapsed",
-                            )
-                            if uploaded is not None:
-                                update_player_photo(player["id"], uploaded.getvalue(), uploaded.type)
-                                st.success("Photo saved.")
-                                st.rerun()
-                        with st.container(key=f"roster_remove_photo_{player['id']}"):
-                            if st.button("Remove Photo", key=f"remove_photo_{player['id']}"):
-                                remove_player_photo(player["id"])
-                                st.success("Photo removed.")
-                                st.rerun()
 
 
 def inject_css(background_url: str = "") -> None:
     dark = is_dark_mode()
     text = "#f9fafb" if dark else "#111827"
-    muted = "#cbd5e1" if dark else "#4b5563"
-    page_bg = "#070a0f" if dark else "#f5f7fb"
-    panel = "rgba(255, 255, 255, 0.075)" if dark else "rgba(255, 255, 255, 0.9)"
-    panel_border = "rgba(255, 255, 255, 0.14)" if dark else "rgba(17, 24, 39, 0.12)"
+    muted = "#cbd5e1" if dark else "#475569"
+    page_bg = "#05070c" if dark else "#f4f8fb"
+    panel = "rgba(15, 23, 42, 0.78)" if dark else "rgba(255, 255, 255, 0.92)"
+    panel_border = "rgba(125, 211, 252, 0.18)" if dark else "rgba(15, 23, 42, 0.12)"
     placeholder_bg = "#f3f4f6" if dark else "#e5e7eb"
     placeholder_text = "#737373" if dark else "#4b5563"
-    widget_bg = "#161b24" if dark else "#ffffff"
+    widget_bg = "#121826" if dark else "#ffffff"
     widget_text = "#f9fafb" if dark else "#111827"
-    widget_border = "rgba(255, 255, 255, 0.18)" if dark else "rgba(17, 24, 39, 0.20)"
+    widget_border = "rgba(148, 163, 184, 0.26)" if dark else "rgba(15, 23, 42, 0.18)"
     disabled_bg = "#0f141c" if dark else "#eef2f7"
     disabled_text = "#9ca3af" if dark else "#111827"
     overlay = (
@@ -2212,10 +2577,10 @@ def inject_css(background_url: str = "") -> None:
             text-transform: uppercase;
         }}
         .carousel-player-name {{
-            font-size: 0.92rem;
+            font-size: 0.86rem;
             font-weight: 950;
             line-height: 1.1;
-            margin: 0.28rem 0 0;
+            margin: 0.34rem 0 0;
             overflow-wrap: anywhere;
             text-align: center;
             text-shadow: 0 1px 0 rgba(255, 255, 255, 0.72);
@@ -2229,11 +2594,11 @@ def inject_css(background_url: str = "") -> None:
             text-align: center;
         }}
         .carousel-avatar {{
-            border-radius: 999px;
+            border-radius: 7px;
             display: block;
             margin: 0 auto;
             object-fit: cover;
-            outline: 2px solid rgba(255, 255, 255, 0.72);
+            outline: 2px solid rgba(255, 255, 255, 0.78);
         }}
         .carousel-avatar-placeholder,
         .photo-placeholder {{
@@ -2243,11 +2608,12 @@ def inject_css(background_url: str = "") -> None:
             border-radius: 999px;
             color: {placeholder_text};
             display: flex;
-            font-size: 1.8rem;
-            font-weight: 800;
+            font-size: 1.1rem;
+            font-weight: 950;
             justify-content: center;
         }}
         .carousel-avatar-placeholder {{
+            border-radius: 7px;
             margin: 0 auto;
         }}
         .photo-placeholder {{
@@ -2271,14 +2637,17 @@ def inject_css(background_url: str = "") -> None:
                 linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0) 32%),
                 linear-gradient(90deg, #f59e0b, #facc15 22%, #fbbf24 78%, #f59e0b);
             border: 3px solid #111827;
-            border-bottom-width: 8px;
+            border-bottom-width: 6px;
             border-radius: 8px 8px 14px 14px;
             box-shadow: 0 16px 38px rgba(0, 0, 0, 0.34);
+            margin-bottom: 1.75rem;
             overflow-x: auto;
-            overflow-y: hidden;
-            padding: 0.25rem 0.7rem 0.75rem;
+            overflow-y: visible;
+            padding: 0.9rem 0.7rem 1.35rem;
             position: relative;
             scrollbar-width: thin;
+            touch-action: pan-x;
+            -webkit-overflow-scrolling: touch;
         }}
         .st-key-game_night_player_bus::before,
         .st-key-game_night_player_bus::after,
@@ -2286,19 +2655,21 @@ def inject_css(background_url: str = "") -> None:
         .st-key-player_page_player_bus::after {{
             background: #111827;
             border-radius: 999px;
-            bottom: 0.12rem;
+            border: 5px solid #334155;
+            bottom: -1.45rem;
             content: "";
-            height: 1.15rem;
+            height: 2.15rem;
             position: absolute;
-            width: 1.15rem;
+            width: 2.15rem;
+            z-index: 2;
         }}
         .st-key-game_night_player_bus::before,
         .st-key-player_page_player_bus::before {{
-            left: 1.2rem;
+            left: 1.35rem;
         }}
         .st-key-game_night_player_bus::after,
         .st-key-player_page_player_bus::after {{
-            right: 1.2rem;
+            right: 1.35rem;
         }}
         .st-key-game_night_player_bus div[data-testid="stHorizontalBlock"],
         .st-key-player_page_player_bus div[data-testid="stHorizontalBlock"] {{
@@ -2306,12 +2677,13 @@ def inject_css(background_url: str = "") -> None:
             flex-wrap: nowrap !important;
             gap: 0.55rem;
             min-width: max-content;
+            padding-bottom: 0.15rem;
         }}
         .st-key-game_night_player_bus div[data-testid="stColumn"],
         .st-key-player_page_player_bus div[data-testid="stColumn"] {{
-            flex: 0 0 7rem !important;
-            min-width: 7rem !important;
-            width: 7rem !important;
+            flex: 0 0 7.25rem !important;
+            min-width: 7.25rem !important;
+            width: 7.25rem !important;
         }}
         [class*="st-key-game_night_player_tile_"],
         [class*="st-key-player_page_player_tile_"] {{
@@ -2320,8 +2692,8 @@ def inject_css(background_url: str = "") -> None:
             border-radius: 7px;
             box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.7);
             cursor: pointer;
-            min-height: 7.1rem;
-            padding: 0.45rem 0.35rem 0.35rem;
+            min-height: 7.55rem;
+            padding: 0.38rem 0.35rem 0.35rem;
             position: relative;
         }}
         [class*="st-key-game_night_player_tile_"] .carousel-avatar,
@@ -2336,24 +2708,24 @@ def inject_css(background_url: str = "") -> None:
             left: 50%;
             overflow: visible;
             position: absolute;
-            top: 0.25rem;
+            top: 0.32rem;
             transform: translateX(-50%);
-            width: 64px;
+            width: 78px;
             z-index: 5;
         }}
         [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button {{
             background: transparent !important;
             border: 0 !important;
-            border-radius: 999px;
+            border-radius: 7px;
             box-shadow: none !important;
             color: transparent !important;
             cursor: pointer;
-            height: 64px;
-            min-height: 64px;
+            height: 78px;
+            min-height: 78px;
             opacity: 0;
             padding: 0;
-            width: 64px;
+            width: 78px;
         }}
         [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button *,
         [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button * {{
@@ -2474,87 +2846,102 @@ def inject_css(background_url: str = "") -> None:
             position: absolute;
             width: 112px;
         }}
-        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] {{
-            width: 84px;
-        }}
-        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
-            height: 84px;
-            min-height: 84px;
-            width: 84px;
-        }}
-        [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
-            height: 84px;
-            width: 84px;
-        }}
-        [class*="st-key-roster_photo_actions_"] {{
-            max-width: 9.5rem;
-        }}
-        [class*="st-key-roster_photo_actions_"] div[data-testid="stVerticalBlock"] {{
-            gap: 0.35rem;
-        }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] {{
-            width: 100%;
-        }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] {{
-            background: transparent;
-            border: 0;
-            border-radius: 0;
-            display: block;
-            height: auto;
-            min-height: 0;
-            padding: 0;
-            width: 100%;
-        }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"]::before {{
-            content: none;
-        }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] > div {{
-            display: none;
-        }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
-            background: {widget_bg} !important;
-            border: 1px solid {widget_border} !important;
-            border-radius: 8px;
-            color: transparent !important;
-            cursor: pointer;
-            font-size: 0;
-            font-weight: 800;
-            height: auto;
-            min-height: 2rem;
-            opacity: 1;
-            padding: 0.35rem 0.55rem;
+        [class*="st-key-player_page_photo_click_"],
+        [class*="st-key-roster_photo_click_"] {{
+            margin: 0 auto;
+            max-width: 9rem;
             position: relative;
-            width: 100%;
+            text-align: center;
         }}
-        [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button::after {{
-            color: {widget_text};
-            content: "Change Photo";
-            font-size: 0.78rem;
-            line-height: 1.1;
+        .profile-photo-click-target {{
+            background:
+                radial-gradient(circle at 25% 20%, rgba(125, 211, 252, 0.26), transparent 35%),
+                linear-gradient(135deg, #111827, #0f172a);
+            border: 1px solid rgba(125, 211, 252, 0.32);
+            border-radius: 14px;
+            box-shadow: 0 14px 34px rgba(0, 0, 0, 0.32);
+            color: #e2e8f0;
+            display: flex;
+            font-size: 2rem;
+            font-weight: 950;
+            justify-content: center;
+            object-fit: cover;
+            position: relative;
+            z-index: 1;
         }}
-        [class*="st-key-roster_remove_photo_"] div[data-testid="stButton"] button {{
-            font-size: 0.78rem;
-            min-height: 2rem;
-            padding: 0.35rem 0.55rem;
+        .profile-photo-click-target.is-empty {{
+            align-items: center;
+            border-style: solid;
         }}
-        [class*="st-key-roster_row_"] div[data-testid="stHorizontalBlock"] {{
-            align-items: start;
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] {{
+            left: 50%;
+            margin: 0;
+            opacity: 0;
+            position: absolute;
+            top: 0;
+            transform: translateX(-50%);
+            z-index: 5;
+        }}
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+            height: 132px;
+            min-height: 132px;
+            width: 132px;
+        }}
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"],
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
+        [class*="st-key-roster_photo_click_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
+            height: 104px;
+            min-height: 104px;
+            width: 104px;
+        }}
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stCaptionContainer"] p,
+        [class*="st-key-roster_photo_click_"] div[data-testid="stCaptionContainer"] p {{
+            color: {muted} !important;
+            font-size: 0.74rem;
+            line-height: 1.15;
+            margin-top: 0.35rem;
+        }}
+        [class*="st-key-player_page_photo_click_"] div[data-testid="stButton"] button,
+        [class*="st-key-roster_photo_click_"] div[data-testid="stButton"] button {{
+            border-radius: 999px;
+            font-size: 0.72rem;
+            min-height: 1.85rem;
+            padding: 0.2rem 0.5rem;
+        }}
+        [class*="st-key-player_profile_summary_"] {{
+            background:
+                linear-gradient(135deg, rgba(34, 197, 94, 0.12), rgba(14, 165, 233, 0.08)),
+                {panel};
+        }}
+        [class*="st-key-roster_card_"] {{
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent),
+                {panel};
+            min-height: 22rem;
+        }}
+        [class*="st-key-stat_entry_fields_"] div[data-testid="stHorizontalBlock"] {{
+            align-items: end;
             flex-wrap: nowrap !important;
             gap: 0.75rem;
         }}
-        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:first-child {{
-            flex: 0 0 5.25rem !important;
-            min-width: 5.25rem !important;
-            width: 5.25rem !important;
+        [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] input {{
+            min-width: 0;
+            text-align: center;
         }}
-        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:nth-child(2) {{
-            flex: 1 1 auto !important;
-            min-width: 8rem !important;
+        [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] button {{
+            width: 1.7rem;
+            min-width: 1.7rem;
         }}
-        [class*="st-key-roster_row_"] div[data-testid="stColumn"]:last-child {{
-            flex: 0 0 9.5rem !important;
-            min-width: 9.5rem !important;
-            width: 9.5rem !important;
+        [class*="st-key-bulk_game_table_"] {{
+            overflow-x: auto;
+            padding-bottom: 0.35rem;
+        }}
+        [class*="st-key-bulk_game_table_"] div[data-testid="stDataFrame"],
+        [class*="st-key-bulk_game_table_"] div[data-testid="stDataEditor"] {{
+            min-width: 58rem;
         }}
         @media (max-width: 760px) {{
             .block-container {{
@@ -2583,6 +2970,7 @@ def inject_css(background_url: str = "") -> None:
             }}
             .st-key-game_night_player_bus,
             .st-key-player_page_player_bus {{
+                margin-bottom: 1.6rem;
                 padding-left: 0.45rem;
                 padding-right: 0.45rem;
             }}
@@ -2596,9 +2984,31 @@ def inject_css(background_url: str = "") -> None:
             }}
             .st-key-game_night_player_bus div[data-testid="stColumn"],
             .st-key-player_page_player_bus div[data-testid="stColumn"] {{
-                flex: 0 0 4.8rem !important;
-                min-width: 4.8rem !important;
-                width: 4.8rem !important;
+                flex: 0 0 5rem !important;
+                min-width: 5rem !important;
+                width: 5rem !important;
+            }}
+            [class*="st-key-game_night_player_tile_"],
+            [class*="st-key-player_page_player_tile_"] {{
+                min-height: 6.55rem;
+                padding: 0.25rem 0.22rem;
+            }}
+            [class*="st-key-game_night_player_tile_"] .carousel-avatar,
+            [class*="st-key-game_night_player_tile_"] .carousel-avatar-placeholder,
+            [class*="st-key-player_page_player_tile_"] .carousel-avatar,
+            [class*="st-key-player_page_player_tile_"] .carousel-avatar-placeholder {{
+                height: 62px !important;
+                width: 62px !important;
+            }}
+            [class*="st-key-game_night_player_"][data-testid="stElementContainer"],
+            [class*="st-key-player_page_player_"][data-testid="stElementContainer"] {{
+                width: 62px;
+            }}
+            [class*="st-key-game_night_player_tile_"] div[data-testid="stButton"] button,
+            [class*="st-key-player_page_player_tile_"] div[data-testid="stButton"] button {{
+                height: 62px;
+                min-height: 62px;
+                width: 62px;
             }}
             div[data-testid="stButton"] button {{
                 font-size: 0.72rem;
@@ -2624,42 +3034,39 @@ def inject_css(background_url: str = "") -> None:
                 max-height: 92px;
                 max-width: 92px;
             }}
-            [class*="st-key-roster_row_"] {{
+            [class*="st-key-stat_entry_fields_"] {{
                 overflow-x: auto;
                 padding-bottom: 0.2rem;
             }}
-            [class*="st-key-roster_row_"] div[data-testid="stHorizontalBlock"] {{
-                gap: 0.5rem;
-                min-width: 21rem;
+            [class*="st-key-stat_entry_fields_"] div[data-testid="stHorizontalBlock"] {{
+                gap: 0.2rem;
+                min-width: 18.2rem;
             }}
-            [class*="st-key-roster_row_"] div[data-testid="stColumn"]:first-child {{
-                flex-basis: 4.75rem !important;
-                min-width: 4.75rem !important;
-                width: 4.75rem !important;
+            [class*="st-key-stat_entry_fields_"] div[data-testid="stColumn"] {{
+                flex: 0 0 3.38rem !important;
+                min-width: 3.38rem !important;
+                width: 3.38rem !important;
             }}
-            [class*="st-key-roster_row_"] div[data-testid="stColumn"]:last-child {{
-                flex-basis: 7.4rem !important;
-                min-width: 7.4rem !important;
-                width: 7.4rem !important;
-            }}
-            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"],
-            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"],
-            [class*="st-key-roster_photo_tile_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button {{
-                height: 76px;
-                min-height: 76px;
-                width: 76px;
-            }}
-            [class*="st-key-roster_photo_actions_"] {{
-                max-width: 7.4rem;
-            }}
-            [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button,
-            [class*="st-key-roster_remove_photo_"] div[data-testid="stButton"] button {{
+            [class*="st-key-stat_entry_fields_"] label p {{
                 font-size: 0.68rem;
-                min-height: 1.85rem;
-                padding: 0.25rem 0.35rem;
             }}
-            [class*="st-key-roster_change_photo_"] div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] button::after {{
-                font-size: 0.68rem;
+            [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] input {{
+                font-size: 0.88rem;
+                padding-left: 0.15rem;
+                padding-right: 0.15rem;
+            }}
+            [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] button {{
+                width: 1rem;
+                min-width: 1rem;
+                padding-left: 0;
+                padding-right: 0;
+            }}
+            [class*="st-key-bulk_game_table_"] div[data-testid="stDataFrame"],
+            [class*="st-key-bulk_game_table_"] div[data-testid="stDataEditor"] {{
+                min-width: 54rem;
+            }}
+            [class*="st-key-roster_card_"] {{
+                min-height: 20rem;
             }}
         }}
         </style>
