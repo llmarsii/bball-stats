@@ -1355,6 +1355,8 @@ def render_stat_stepper(label: str, key: str, value: int, label_visibility: str 
 def stat_line_validation_errors(values: dict, player_name: str = "") -> list[str]:
     prefix = f"{player_name}: " if player_name else ""
     errors = []
+    if values.get("result") not in {"W", "L"}:
+        errors.append(f"{prefix}Choose W or L before saving.")
     if values["field_goals_made"] > values["field_goals_attempted"]:
         errors.append(f"{prefix}FGM cannot be greater than FGA.")
     if values["threes"] > values["three_attempts"]:
@@ -1855,11 +1857,81 @@ def render_game_player_bus(players: list[dict], selected_player_ids: list[int], 
                 st.rerun()
 
 
+def stat_line_selector_label(row: pd.Series, fantasy: bool = False) -> str:
+    game_date = parse_game_date(row["game_date"])
+    date_label = format_date_with_weekday(game_date) if game_date else str(row["game_date"])
+    mode_label = "Fantasy" if fantasy else "Regular"
+    result = row.get("result") if row.get("result") in {"W", "L"} else "Needs W/L"
+    return (
+        f"{date_label} - Game {int(row['game_number'])} - {mode_label} - "
+        f"{result} - {int(row['points'])} PTS"
+    )
+
+
+def render_player_game_manager(player: dict, scoped_df: pd.DataFrame, fantasy: bool = False) -> None:
+    if scoped_df.empty:
+        return
+    mode_key = "fantasy" if fantasy else "regular"
+    rows = scoped_df.sort_values(["game_date", "game_number"], ascending=[False, False]).reset_index(drop=True)
+    display = display_stat_lines(rows)
+    if "Player" in display.columns:
+        display = display.drop(columns=["Player"])
+
+    st.caption("Select a saved stat line to edit it or delete it.")
+    render_stats_dataframe(display, use_container_width=True, hide_index=True)
+
+    labels = [stat_line_selector_label(row, fantasy=fantasy) for _, row in rows.iterrows()]
+    selector_key = f"player_game_manager_{mode_key}_{player['id']}"
+    if st.session_state.get(selector_key) not in labels:
+        st.session_state.pop(selector_key, None)
+    selected_label = st.selectbox(
+        "Saved game",
+        options=labels,
+        key=selector_key,
+    )
+    selected_row = rows.iloc[labels.index(selected_label)]
+    selected_date = parse_game_date(selected_row["game_date"])
+    if selected_date is None:
+        st.error("This saved stat line has an invalid date and cannot be edited here.")
+        return
+
+    selected_game = int(selected_row["game_number"])
+    selected_stats = default_stat_values(selected_row.to_dict())
+    edit_key = f"editing_{mode_key}_{selected_date}_{selected_game}_{player['id']}"
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button(
+            "Edit Selected Stats",
+            key=f"player_page_edit_{mode_key}_{selected_date}_{selected_game}_{player['id']}",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.session_state[edit_key] = True
+            st.rerun()
+    with action_cols[1]:
+        confirm_key = f"player_page_confirm_delete_{mode_key}_{selected_date}_{selected_game}_{player['id']}"
+        confirmed = st.checkbox("Confirm delete", key=confirm_key)
+        if st.button(
+            "Delete Selected Game",
+            key=f"player_page_delete_{mode_key}_{selected_date}_{selected_game}_{player['id']}",
+            disabled=not confirmed,
+            use_container_width=True,
+        ):
+            delete_stat_line(selected_date, selected_game, player["id"], fantasy=fantasy)
+            st.session_state.pop(confirm_key, None)
+            st.session_state.pop(selector_key, None)
+            st.success(f"Deleted {player['name']} Game {selected_game}.")
+            st.rerun()
+
+    if st.session_state.get(edit_key, False):
+        render_stat_form(player, selected_date, selected_game, selected_stats, fantasy=fantasy)
+
+
 def render_player_stats_detail(player: dict) -> None:
     player_view, filtered_all = render_stats_scope_controls("player_page", all_stats())
     scoped_df = filtered_all[filtered_all["player_id"] == player["id"]].copy() if not filtered_all.empty else filtered_all
-    completed = scoped_df[scoped_df["result"].isin(["W", "L"])].copy() if not scoped_df.empty else scoped_df
-    summary = aggregate_player_totals(completed, ["player_id", "name"]) if not completed.empty else pd.DataFrame()
+    summary = aggregate_player_totals(scoped_df, ["player_id", "name"]) if not scoped_df.empty else pd.DataFrame()
 
     with st.container(border=True, key=f"player_profile_summary_{player['id']}"):
         st.markdown(f"### {player['name']}")
@@ -1879,74 +1951,83 @@ def render_player_stats_detail(player: dict) -> None:
                 metric_cols[2].metric("PPG", formatted_metric_average(row["points"] / total_games))
                 metric_cols[3].metric("RPG", formatted_metric_average(row["rebounds"] / total_games))
 
+    missing_results = scoped_df[~scoped_df["result"].isin(["W", "L"])] if not scoped_df.empty else scoped_df
+    if not missing_results.empty:
+        st.warning(
+            f"{len(missing_results)} saved stat line"
+            f"{'' if len(missing_results) == 1 else 's'} for {player['name']} need W/L. "
+            "Edit the row below to complete it."
+        )
+
     filtered = scoped_df
-    completed = filtered[filtered["result"].isin(["W", "L"])].copy() if not filtered.empty else filtered
-    history = aggregate_player_totals(completed, ["game_date", "player_id", "name"]).sort_values("game_date", ascending=False) if not completed.empty else pd.DataFrame()
+    history = aggregate_player_totals(filtered, ["game_date", "player_id", "name"]).sort_values("game_date", ascending=False) if not filtered.empty else pd.DataFrame()
 
     if history.empty:
         st.info(f"No stat lines saved for {player['name']} in this view yet.")
-        return
-
-    if player_view == "Per game averages":
-        display = player_average_display(history)
     else:
-        display_columns = [
-            "game_date",
-            "games",
-            "wins",
-            "losses",
-            "record",
-            "points",
-            "field_goals_made",
-            "field_goals_attempted",
-            "rebounds",
-            "assists",
-            "steals",
-            "blocks",
-            "threes",
-            "three_attempts",
-            "turnovers",
-        ]
-        display = history[display_columns].rename(
-            columns={
-                "game_date": "Date",
-                "games": "Games",
-                "wins": "W",
-                "losses": "L",
-                "record": "W-L",
-                "points": "PTS",
-                "field_goals_made": "FGM",
-                "field_goals_attempted": "FGA",
-                "rebounds": "REB",
-                "assists": "AST",
-                "steals": "STL",
-                "blocks": "BLK",
-                "threes": "3PM",
-                "three_attempts": "3PA",
-                "turnovers": "TO",
-            }
+        if player_view == "Per game averages":
+            display = player_average_display(history)
+        else:
+            display_columns = [
+                "game_date",
+                "games",
+                "wins",
+                "losses",
+                "record",
+                "points",
+                "field_goals_made",
+                "field_goals_attempted",
+                "rebounds",
+                "assists",
+                "steals",
+                "blocks",
+                "threes",
+                "three_attempts",
+                "turnovers",
+            ]
+            display = history[display_columns].rename(
+                columns={
+                    "game_date": "Date",
+                    "games": "Games",
+                    "wins": "W",
+                    "losses": "L",
+                    "record": "W-L",
+                    "points": "PTS",
+                    "field_goals_made": "FGM",
+                    "field_goals_attempted": "FGA",
+                    "rebounds": "REB",
+                    "assists": "AST",
+                    "steals": "STL",
+                    "blocks": "BLK",
+                    "threes": "3PM",
+                    "three_attempts": "3PA",
+                    "turnovers": "TO",
+                }
+            )
+
+        st.caption("Filtered player results. Click any column header to sort.")
+        render_stats_dataframe(display, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Player CSV",
+            data=display.to_csv(index=False),
+            file_name=f"{csv_safe_name(player['name'])}_stats.csv",
+            mime="text/csv",
         )
 
-    st.caption("Filtered player results. Click any column header to sort.")
-    render_stats_dataframe(display, use_container_width=True, hide_index=True)
-    st.download_button(
-        "Download Player CSV",
-        data=display.to_csv(index=False),
-        file_name=f"{csv_safe_name(player['name'])}_stats.csv",
-        mime="text/csv",
-    )
+    if not filtered.empty:
+        with st.expander("Edit or delete saved games", expanded=True):
+            render_player_game_manager(player, filtered, fantasy=False)
 
-    with st.expander("Game-by-game log", expanded=False):
-        games = add_percentages(filtered).sort_values(["game_date", "game_number"], ascending=[False, False])
-        game_columns = ["game_date", *GAME_LOG_COLUMNS.keys()]
-        game_columns.remove("name")
-        game_display = games[game_columns].rename(
-            columns={
-                "game_date": "Date",
-                **GAME_LOG_COLUMNS,
-            }
-        )
-        render_stats_dataframe(game_display, use_container_width=True, hide_index=True)
+    with st.expander("Fantasy games", expanded=False):
+        st.caption("Fantasy games stay off the Nightly Summary and Leaderboards.")
+        fantasy_df = all_stats(fantasy=True)
+        fantasy_rows = fantasy_df[fantasy_df["player_id"] == player["id"]].copy() if not fantasy_df.empty else fantasy_df
+        if fantasy_rows.empty:
+            st.info(f"No fantasy stat lines saved for {player['name']} yet.")
+        else:
+            fantasy_summary = fantasy_summary_display(fantasy_rows)
+            render_stats_dataframe(fantasy_summary, use_container_width=True, hide_index=True)
+            render_player_game_manager(player, fantasy_rows, fantasy=True)
 
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -2121,23 +2202,27 @@ def render_player_photo_manager(player: dict, scope: str) -> None:
 
 
 def render_stat_form(player: dict, game_date: date, game_number: int, stats: dict, fantasy: bool = False) -> None:
-    result_options = ["", "W", "L"]
+    result_options = ["W", "L"]
     current_result = stats.get("result", "")
     result_index = result_options.index(current_result) if current_result in result_options else 0
     mode_key = "fantasy" if fantasy else "regular"
+    result_key = f"result_{mode_key}_{game_date}_{game_number}_{player['id']}"
+    if st.session_state.get(result_key) not in result_options:
+        st.session_state.pop(result_key, None)
 
     with st.container(key=f"stat_form_{mode_key}_{game_date}_{game_number}_{player['id']}"):
         st.markdown(f"### {player['name']} - Game {game_number}")
         st.caption(format_game_date(game_date))
         if fantasy:
             st.caption("Fantasy stats are hidden from Nightly Summary and Leaderboards.")
+        if current_result not in result_options and stats:
+            st.warning("This saved stat line is missing W/L. Pick W or L before saving your edit.")
         result = st.radio(
             "Team result",
             options=result_options,
             index=result_index,
             horizontal=True,
-            format_func=lambda option: "Unset" if option == "" else option,
-            key=f"result_{mode_key}_{game_date}_{game_number}_{player['id']}",
+            key=result_key,
         )
 
         stat_values = {"result": result}
@@ -2338,14 +2423,16 @@ def render_bulk_game_form(players: list[dict], game_date: date, fantasy: bool = 
             with row_cols[0]:
                 st.markdown(f"**{player_names[player_id]}**")
             with row_cols[1]:
-                result_options = ["", "W", "L"]
-                current_result = values["result"] if values["result"] in result_options else ""
+                result_options = ["W", "L"]
+                current_result = values["result"] if values["result"] in result_options else "W"
+                result_key = f"bulk_result_{mode_key}_{game_date}_{selected_game}_{player_id}"
+                if st.session_state.get(result_key) not in result_options:
+                    st.session_state.pop(result_key, None)
                 result = st.selectbox(
                     "W/L",
                     options=result_options,
                     index=result_options.index(current_result),
-                    format_func=lambda option: "-" if option == "" else option,
-                    key=f"bulk_result_{mode_key}_{game_date}_{selected_game}_{player_id}",
+                    key=result_key,
                     label_visibility="collapsed",
                 )
 
@@ -2385,8 +2472,6 @@ def render_bulk_game_form(players: list[dict], game_date: date, fantasy: bool = 
 
     validation_errors = []
     for player_id, values in player_values:
-        if values["result"] not in ["", "W", "L"]:
-            validation_errors.append(f"{player_names[player_id]}: W/L must be W, L, or blank.")
         validation_errors.extend(stat_line_validation_errors(values, player_names[player_id]))
 
     if validation_errors:
@@ -2742,14 +2827,19 @@ def render_leaderboard() -> None:
 
     custom_stats = render_custom_stat_builder()
 
-    completed = filtered[filtered["result"].isin(["W", "L"])].copy()
-    if completed.empty:
-        st.info("Saved rows need W/L results before standings can be calculated.")
-        display_df = display_stat_lines(filtered)
-        render_stats_dataframe(display_df, use_container_width=True, hide_index=True)
+    if filtered.empty:
+        st.info("No regular stat lines match the selected game nights.")
         return
 
-    grouped = completed.groupby("name", as_index=False).agg(
+    incomplete = filtered[~filtered["result"].isin(["W", "L"])].copy()
+    if not incomplete.empty:
+        st.warning(
+            f"{len(incomplete)} saved regular stat line"
+            f"{'' if len(incomplete) == 1 else 's'} need W/L. "
+            "They are included here with 0 wins and 0 losses until edited."
+        )
+
+    grouped = filtered.groupby("name", as_index=False).agg(
         GP=("game_number", "count"),
         Nights=("game_date", "nunique"),
         W=("result", lambda values: int((values == "W").sum())),
