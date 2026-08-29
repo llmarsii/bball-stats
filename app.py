@@ -1317,6 +1317,41 @@ def stat_input(label: str, key: str, value: int, label_visibility: str = "visibl
     )
 
 
+def render_stat_stepper(label: str, key: str, value: int, label_visibility: str = "visible") -> int:
+    current_value = int(st.session_state.get(key, value) or 0)
+    with st.container(key=f"stat_stepper_{key}"):
+        if label_visibility == "visible":
+            st.markdown(f'<div class="stat-stepper-label">{html.escape(label)}</div>', unsafe_allow_html=True)
+        step_cols = st.columns([0.82, 1.35, 0.82])
+        with step_cols[0]:
+            st.button(
+                r"\-",
+                key=f"{key}_minus",
+                on_click=adjust_number_state,
+                args=(key, -1),
+                use_container_width=True,
+            )
+        with step_cols[1]:
+            value = st.number_input(
+                label,
+                min_value=0,
+                max_value=200,
+                value=current_value,
+                step=1,
+                key=key,
+                label_visibility="collapsed",
+            )
+        with step_cols[2]:
+            st.button(
+                r"\+",
+                key=f"{key}_plus",
+                on_click=adjust_number_state,
+                args=(key, 1),
+                use_container_width=True,
+            )
+    return int(value or 0)
+
+
 def stat_line_validation_errors(values: dict, player_name: str = "") -> list[str]:
     prefix = f"{player_name}: " if player_name else ""
     errors = []
@@ -1759,48 +1794,65 @@ def render_player_picker(
 
 def render_game_player_bus(players: list[dict], selected_player_ids: list[int], selection_key: str) -> None:
     selected_ids = set(selected_player_ids)
+    current_player_id = selected_player_id(players)
+    current_index = next(
+        (index for index, player in enumerate(players) if player["id"] == current_player_id),
+        0,
+    )
     st.caption("Click a bus window to add or remove players for this game.")
     with st.container(key="game_night_player_picker"):
-        with st.container(key="game_night_player_bus"):
-            columns = st.columns(len(players))
-            for index, player in enumerate(players):
-                color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
-                selected = player["id"] in selected_ids
-                badge = "In game" if selected else "Click to add"
-                with columns[index]:
-                    with st.container(key=f"game_night_player_tile_{player['id']}"):
-                        render_player_avatar(player, size=78)
-                        st.markdown(
-                            (
-                                f'<div class="carousel-player-name" style="color:{color};">'
-                                f'{html.escape(player["name"])}</div>'
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            (
-                                f'<div class="carousel-player-badge {"is-selected" if selected else ""}">'
-                                f'{badge}</div>'
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                        if st.button(
-                            "Remove from game" if selected else "Add to game",
-                            key=f"game_night_player_{player['id']}",
-                            use_container_width=True,
-                        ):
-                            updated_ids = set(st.session_state.get(selection_key, []))
-                            if selected:
-                                updated_ids.discard(player["id"])
-                            else:
-                                updated_ids.add(player["id"])
-                            st.session_state[selection_key] = [
-                                player_option["id"]
-                                for player_option in players
-                                if player_option["id"] in updated_ids
-                            ]
-                            st.rerun()
+        nav_cols = st.columns([0.55, 8, 0.55])
+        with nav_cols[0]:
+            if st.button("‹", key="game_night_prev_player", use_container_width=True, help="Previous player"):
+                select_player(players[(current_index - 1) % len(players)]["id"])
+                st.rerun()
+
+        with nav_cols[1]:
+            with st.container(key="game_night_player_bus"):
+                columns = st.columns(len(players))
+                for index, player in enumerate(players):
+                    color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
+                    selected = player["id"] in selected_ids
+                    badge = "In game" if selected else "Click to add"
+                    with columns[index]:
+                        with st.container(key=f"game_night_player_tile_{player['id']}"):
+                            render_player_avatar(player, size=78)
+                            st.markdown(
+                                (
+                                    f'<div class="carousel-player-name" style="color:{color};">'
+                                    f'{html.escape(player["name"])}</div>'
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(
+                                (
+                                    f'<div class="carousel-player-badge {"is-selected" if selected else ""}">'
+                                    f'{badge}</div>'
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            if st.button(
+                                "Remove from game" if selected else "Add to game",
+                                key=f"game_night_player_{player['id']}",
+                                use_container_width=True,
+                            ):
+                                updated_ids = set(st.session_state.get(selection_key, []))
+                                if selected:
+                                    updated_ids.discard(player["id"])
+                                else:
+                                    updated_ids.add(player["id"])
+                                st.session_state[selection_key] = [
+                                    player_option["id"]
+                                    for player_option in players
+                                    if player_option["id"] in updated_ids
+                                ]
+                                st.rerun()
             render_bus_wheels()
+
+        with nav_cols[2]:
+            if st.button("›", key="game_night_next_player", use_container_width=True, help="Next player"):
+                select_player(players[(current_index + 1) % len(players)]["id"])
+                st.rerun()
 
 
 def render_player_stats_detail(player: dict) -> None:
@@ -2074,7 +2126,7 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
     result_index = result_options.index(current_result) if current_result in result_options else 0
     mode_key = "fantasy" if fantasy else "regular"
 
-    with st.form(f"stat_form_{mode_key}_{game_date}_{game_number}_{player['id']}"):
+    with st.container(key=f"stat_form_{mode_key}_{game_date}_{game_number}_{player['id']}"):
         st.markdown(f"### {player['name']} - Game {game_number}")
         st.caption(format_game_date(game_date))
         if fantasy:
@@ -2093,7 +2145,7 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             first_row = st.columns(5)
             for index, field in enumerate(["points", "field_goals_made", "field_goals_attempted", "threes", "three_attempts"]):
                 with first_row[index]:
-                    stat_values[field] = stat_input(
+                    stat_values[field] = render_stat_stepper(
                         STAT_FIELDS[field],
                         f"{field}_{mode_key}_{game_date}_{game_number}_{player['id']}",
                         stats.get(field, 0),
@@ -2102,7 +2154,7 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             second_row = st.columns(5)
             for index, field in enumerate(["rebounds", "assists", "steals", "blocks", "turnovers"]):
                 with second_row[index]:
-                    stat_values[field] = stat_input(
+                    stat_values[field] = render_stat_stepper(
                         STAT_FIELDS[field],
                         f"{field}_{mode_key}_{game_date}_{game_number}_{player['id']}",
                         stats.get(field, 0),
@@ -2114,8 +2166,9 @@ def render_stat_form(player: dict, game_date: date, game_number: int, stats: dic
             key=f"notes_{mode_key}_{game_date}_{game_number}_{player['id']}",
             placeholder="Optional fantasy comment" if fantasy else "Optional",
         )
-        submitted = st.form_submit_button(
+        submitted = st.button(
             "Save Fantasy Game" if fantasy else "Save Game",
+            key=f"save_single_{mode_key}_{game_date}_{game_number}_{player['id']}",
             type="primary",
             use_container_width=True,
     )
@@ -2300,33 +2353,12 @@ def render_bulk_game_form(players: list[dict], game_date: date, fantasy: bool = 
             for col, (label, field) in zip(row_cols[2:-1], BULK_STAT_COLUMNS):
                 with col:
                     value_key = f"bulk_{field}_{mode_key}_{game_date}_{selected_game}_{player_id}"
-                    if value_key not in st.session_state:
-                        st.session_state[value_key] = values[field]
-                    with st.container(key=f"bulk_stepper_{field}_{mode_key}_{game_date}_{selected_game}_{player_id}"):
-                        step_cols = st.columns([0.95, 1.05, 0.95])
-                        with step_cols[0]:
-                            st.button(
-                                r"\-",
-                                key=f"{value_key}_minus",
-                                on_click=adjust_number_state,
-                                args=(value_key, -1),
-                                use_container_width=True,
-                            )
-                        with step_cols[1]:
-                            stat_values[field] = stat_input(
-                                label,
-                                value_key,
-                                st.session_state[value_key],
-                                label_visibility="collapsed",
-                            )
-                        with step_cols[2]:
-                            st.button(
-                                r"\+",
-                                key=f"{value_key}_plus",
-                                on_click=adjust_number_state,
-                                args=(value_key, 1),
-                                use_container_width=True,
-                            )
+                    stat_values[field] = render_stat_stepper(
+                        label,
+                        value_key,
+                        values[field],
+                        label_visibility="collapsed",
+                    )
 
             with row_cols[-1]:
                 stat_values["notes"] = st.text_input(
@@ -3483,17 +3515,51 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
             min-height: 22rem;
         }}
         [class*="st-key-stat_entry_fields_"] div[data-testid="stHorizontalBlock"] {{
-            align-items: end;
+            align-items: start;
             flex-wrap: nowrap !important;
-            gap: 0.75rem;
+            gap: 0.9rem;
         }}
-        [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] input {{
+        .stat-stepper-label {{
+            color: {text};
+            font-size: 0.82rem;
+            font-weight: 850;
+            margin-bottom: 0.32rem;
+        }}
+        [class*="st-key-stat_stepper_"] div[data-testid="stHorizontalBlock"] {{
+            align-items: center;
+            flex-wrap: nowrap !important;
+            gap: 0.16rem;
+            min-width: 0 !important;
+        }}
+        [class*="st-key-stat_stepper_"] div[data-testid="stColumn"] {{
+            flex: 0 0 2.65rem !important;
+            min-width: 2.65rem !important;
+            width: 2.65rem !important;
+        }}
+        [class*="st-key-stat_stepper_"] div[data-testid="stColumn"]:nth-child(2) {{
+            flex: 1 1 3.8rem !important;
+            min-width: 3.8rem !important;
+            width: 3.8rem !important;
+        }}
+        [class*="st-key-stat_stepper_"] div[data-testid="stButton"] button {{
+            border-radius: 10px;
+            font-size: 1.08rem;
+            font-weight: 950;
+            min-height: 2.85rem;
+            min-width: 2.55rem;
+            padding: 0;
+        }}
+        [class*="st-key-stat_stepper_"] div[data-testid="stNumberInput"] input {{
+            border-radius: 10px;
+            font-size: 1rem;
+            min-height: 2.85rem;
             min-width: 0;
+            padding-left: 0.15rem;
+            padding-right: 0.15rem;
             text-align: center;
         }}
-        [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] button {{
-            width: 1.7rem;
-            min-width: 1.7rem;
+        [class*="st-key-stat_stepper_"] div[data-testid="stNumberInput"] button {{
+            display: none !important;
         }}
         [class*="st-key-bulk_game_stepper_table_"] {{
             background: {table_bg};
@@ -3507,12 +3573,12 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
             align-items: center;
             flex-wrap: nowrap !important;
             gap: 0.35rem;
-            min-width: 88rem;
+            min-width: 114rem;
         }}
         [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stColumn"] {{
-            flex: 0 0 7.2rem !important;
-            min-width: 7.2rem !important;
-            width: 7.2rem !important;
+            flex: 0 0 9rem !important;
+            min-width: 9rem !important;
+            width: 9rem !important;
         }}
         [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stColumn"]:first-child {{
             background: {table_bg};
@@ -3535,52 +3601,24 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
         [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stMarkdownContainer"] strong {{
             color: {table_text} !important;
         }}
-        [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stNumberInput"] input {{
-            min-width: 2.1rem;
-            padding-left: 0.1rem;
-            padding-right: 0.1rem;
-            text-align: center;
-        }}
-        [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stNumberInput"] button {{
-            width: 1rem;
-            min-width: 1rem;
-            padding-left: 0;
-            padding-right: 0;
-        }}
-        [class*="st-key-bulk_stepper_"] div[data-testid="stHorizontalBlock"] {{
-            gap: 0.08rem;
-            min-width: 0 !important;
-        }}
-        [class*="st-key-bulk_stepper_"] div[data-testid="stColumn"],
-        [class*="st-key-bulk_stepper_"] div[data-testid="stColumn"]:first-child {{
+        [class*="st-key-bulk_game_stepper_table_"] [class*="st-key-stat_stepper_"] div[data-testid="stColumn"],
+        [class*="st-key-bulk_game_stepper_table_"] [class*="st-key-stat_stepper_"] div[data-testid="stColumn"]:first-child,
+        [class*="st-key-bulk_game_stepper_table_"] [class*="st-key-stat_stepper_"] div[data-testid="stColumn"]:nth-child(2) {{
             background: transparent;
             border-right: 0;
-            flex: 1 1 0 !important;
+            flex: 0 0 2.65rem !important;
             left: auto;
             min-height: 0;
-            min-width: 0 !important;
+            min-width: 2.65rem !important;
             padding: 0;
             position: static;
-            width: auto !important;
+            width: 2.65rem !important;
             z-index: auto;
         }}
-        [class*="st-key-bulk_stepper_"] div[data-testid="stButton"] button {{
-            background: {widget_bg} !important;
-            color: {widget_text} !important;
-            border-radius: 7px;
-            font-size: 0.95rem;
-            font-weight: 950;
-            min-height: 2.45rem;
-            padding: 0;
-        }}
-        [class*="st-key-bulk_stepper_"] div[data-testid="stButton"] button p {{
-            color: {widget_text} !important;
-        }}
-        [class*="st-key-bulk_stepper_"] div[data-testid="stNumberInput"] input {{
-            background: {widget_bg} !important;
-            border-radius: 7px;
-            color: {widget_text} !important;
-            min-height: 2.45rem;
+        [class*="st-key-bulk_game_stepper_table_"] [class*="st-key-stat_stepper_"] div[data-testid="stColumn"]:nth-child(2) {{
+            flex: 1 1 3.8rem !important;
+            min-width: 3.8rem !important;
+            width: 3.8rem !important;
         }}
         [class*="st-key-custom_stat_builder_controls"] div[data-testid="stHorizontalBlock"] {{
             align-items: end;
@@ -3641,6 +3679,7 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
             .bus-wheels {{
                 margin-left: 1rem;
                 margin-right: 1rem;
+                transform: translateZ(0);
             }}
             .bus-wheels span {{
                 height: 2.7rem;
@@ -3650,9 +3689,19 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
             .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child,
             .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child,
             .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {{
-                flex-basis: 2.8rem !important;
-                min-width: 2.8rem !important;
-                width: 2.8rem !important;
+                display: none !important;
+            }}
+            .st-key-game_night_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(2),
+            .st-key-player_page_player_picker > div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(2) {{
+                flex: 1 1 100% !important;
+                min-width: 100% !important;
+                width: 100% !important;
+            }}
+            div[data-testid="stColumn"]:has([class*="st-key-game_night_prev_player"]),
+            div[data-testid="stColumn"]:has([class*="st-key-game_night_next_player"]),
+            div[data-testid="stColumn"]:has([class*="st-key-player_page_prev_player"]),
+            div[data-testid="stColumn"]:has([class*="st-key-player_page_next_player"]) {{
+                display: none !important;
             }}
             .st-key-game_night_player_bus div[data-testid="stColumn"],
             .st-key-player_page_player_bus div[data-testid="stColumn"] {{
@@ -3711,30 +3760,38 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
                 padding-bottom: 0.2rem;
             }}
             [class*="st-key-stat_entry_fields_"] div[data-testid="stHorizontalBlock"] {{
-                gap: 0.2rem;
-                min-width: 18.2rem;
+                gap: 0.45rem;
+                min-width: 47rem;
             }}
             [class*="st-key-stat_entry_fields_"] div[data-testid="stColumn"] {{
-                flex: 0 0 3.38rem !important;
-                min-width: 3.38rem !important;
-                width: 3.38rem !important;
+                flex: 0 0 9rem !important;
+                min-width: 9rem !important;
+                width: 9rem !important;
             }}
             [class*="st-key-stat_entry_fields_"] label p {{
                 font-size: 0.68rem;
+            }}
+            [class*="st-key-stat_stepper_"] div[data-testid="stColumn"] {{
+                flex: 0 0 2.55rem !important;
+                min-width: 2.55rem !important;
+                width: 2.55rem !important;
+            }}
+            [class*="st-key-stat_stepper_"] div[data-testid="stColumn"]:nth-child(2) {{
+                flex: 1 1 3.55rem !important;
+                min-width: 3.55rem !important;
+                width: 3.55rem !important;
+            }}
+            [class*="st-key-stat_stepper_"] div[data-testid="stButton"] button,
+            [class*="st-key-stat_stepper_"] div[data-testid="stNumberInput"] input {{
+                min-height: 2.95rem;
             }}
             [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] input {{
                 font-size: 0.88rem;
                 padding-left: 0.15rem;
                 padding-right: 0.15rem;
             }}
-            [class*="st-key-stat_entry_fields_"] div[data-testid="stNumberInput"] button {{
-                width: 1rem;
-                min-width: 1rem;
-                padding-left: 0;
-                padding-right: 0;
-            }}
             [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stHorizontalBlock"] {{
-                min-width: 84rem;
+                min-width: 114rem;
             }}
             [class*="st-key-roster_card_"] {{
                 min-height: 20rem;
