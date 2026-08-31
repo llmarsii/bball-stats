@@ -3150,10 +3150,11 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
     table_bg = "#0b1019" if dark else "#ffffff"
     table_header = "#1b2230" if dark else "#e8f0f7"
     table_text = "#f8fafc" if dark else "#0f172a"
+    table_border = "rgba(148, 163, 184, 0.24)" if dark else "#d7dee8"
     overlay = (
-        "linear-gradient(rgba(14, 17, 23, 0.82), rgba(14, 17, 23, 0.9))"
+        "linear-gradient(rgba(14, 17, 23, 0.62), rgba(14, 17, 23, 0.72))"
         if dark
-        else "linear-gradient(rgba(248, 250, 252, 0.84), rgba(248, 250, 252, 0.92))"
+        else "linear-gradient(rgba(248, 250, 252, 0.70), rgba(248, 250, 252, 0.82))"
     )
     background_css = f"""
         .stApp {{
@@ -3169,7 +3170,9 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
                 url("{background_url}");
             background-attachment: fixed;
             background-position: center;
-            background-size: cover;
+            background-repeat: no-repeat, no-repeat;
+            background-size: cover, contain;
+            background-color: {page_bg};
             color: {text};
         }}
         """
@@ -3816,7 +3819,43 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
         div[data-testid="stDataFrame"] canvas {{
             background: {table_bg} !important;
         }}
+        div[data-testid="stTable"] {{
+            background: {table_bg} !important;
+            border: 1px solid {panel_border};
+            border-radius: 8px;
+            max-width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }}
+        div[data-testid="stTable"] table {{
+            background: {table_bg} !important;
+            border-collapse: collapse;
+            min-width: 720px;
+            width: max-content;
+        }}
+        div[data-testid="stTable"] thead tr,
+        div[data-testid="stTable"] thead th {{
+            background: {table_header} !important;
+            color: {table_text} !important;
+        }}
+        div[data-testid="stTable"] tbody tr,
+        div[data-testid="stTable"] tbody th,
+        div[data-testid="stTable"] tbody td {{
+            background: {table_bg} !important;
+            color: {table_text} !important;
+        }}
+        div[data-testid="stTable"] th,
+        div[data-testid="stTable"] td {{
+            border-color: {table_border} !important;
+            font-size: 0.86rem;
+            line-height: 1.25;
+            padding: 0.55rem 0.65rem;
+            white-space: nowrap;
+        }}
         @media (max-width: 760px) {{
+            .stApp {{
+                background-size: cover, cover;
+            }}
             .block-container {{
                 padding-left: 0.8rem;
                 padding-right: 0.8rem;
@@ -3962,6 +4001,14 @@ def inject_css(background_url: str = "", secret_background_url: str = "") -> Non
             }}
             [class*="st-key-bulk_game_stepper_table_"] div[data-testid="stHorizontalBlock"] {{
                 min-width: 114rem;
+            }}
+            div[data-testid="stTable"] table {{
+                min-width: 620px;
+            }}
+            div[data-testid="stTable"] th,
+            div[data-testid="stTable"] td {{
+                font-size: 0.76rem;
+                padding: 0.45rem 0.5rem;
             }}
             [class*="st-key-roster_card_"] {{
                 min-height: 20rem;
